@@ -4,9 +4,10 @@ import pandas as pd
 import numpy as np
 import re
 from io import BytesIO
+from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="KPIs por Robot - Aguila Trading", layout="wide")
-st.title("KPIs por Robot - Aguila Trading 🦅")
+st.set_page_config(page_title="KPIs por Robot — MT4 & MT5", layout="wide")
+st.title("📊 KPIs por Robot 🦅 Aguila Trading (MT4 & MT5)")
 
 # ========= Métricas =========
 def max_drawdown(equity: pd.Series) -> float:
@@ -77,7 +78,7 @@ def max_stagnation(times: pd.Series | None, equity: pd.Series) -> str:
         return f"{(t1 - t0).days} d"
     return f"{longest} trades"
 
-# ========= Parsing XLSX (MT5) =========
+# ========= Helpers =========
 def _rename_dupes(cols):
     seen, out = {}, []
     for c in cols:
@@ -89,11 +90,17 @@ def _rename_dupes(cols):
             seen[c] += 1; out.append(f"{c}_{seen[c]}")
     return out
 
+def _ensure_fee_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Asegura columnas commission y swap, y crea real_profit = profit+commission+swap."""
+    for c in ["commission", "swap", "profit"]:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["real_profit"] = df["profit"] + df["commission"] + df["swap"]
+    return df
+
+# ========= Parsing MT5 (XLSX/CSV) — Comment como robot =========
 def parse_mt5_xlsx_use_comment(xlsx_bytes: bytes, time_tolerance="10min", vol_tol=1e-6) -> pd.DataFrame:
-    """
-    Normaliza POSITIONS y etiqueta cada posición con robot_id = Comment (deal 'in').
-    Si no hay match directo por Order/Position, usa merge_asof por símbolo y tiempo (hacia atrás).
-    """
     xls = pd.ExcelFile(BytesIO(xlsx_bytes))
     df_raw = pd.read_excel(xls, xls.sheet_names[0])
     col0 = df_raw.columns[0]
@@ -184,13 +191,107 @@ def parse_mt5_xlsx_use_comment(xlsx_bytes: bytes, time_tolerance="10min", vol_to
             matched_robot = pd.concat(matched_robot).sort_index()
             df_pos.loc[matched_robot.index, "robot_id"] = df_pos.loc[matched_robot.index, "robot_id"].fillna(matched_robot)
 
-    # Último recurso: separar por símbolo (evitar UNASSIGNED global)
+    # Último recurso: separar por símbolo
     if df_pos["robot_id"].isna().any():
         df_pos.loc[df_pos["robot_id"].isna(), "robot_id"] = df_pos.loc[df_pos["robot_id"].isna(), "symbol"] + "_UNKNOWN"
 
-    return df_pos
+    return _ensure_fee_cols(df_pos)
 
-# ========= KPIs =========
+def parse_csv_use_comment(uploaded_csv: BytesIO) -> pd.DataFrame:
+    df_pos = pd.read_csv(uploaded_csv)
+    rename_try = {
+        'Open Time':'open_time','Close Time':'close_time','Symbol':'symbol','Type':'type',
+        'Volume':'volume','Open Price':'open_price','Close Price':'close_price',
+        'Commission':'commission','Swap':'swap','Profit':'profit',
+        'Comment':'robot_id'
+    }
+    df_pos = df_pos.rename(columns={k:v for k,v in rename_try.items() if k in df_pos.columns})
+    for c in ['open_time','close_time']:
+        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
+    for c in ['volume','open_price','close_price','commission','swap','profit']:
+        if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
+    if 'robot_id' not in df_pos.columns:
+        df_pos['robot_id'] = "UNKNOWN"
+    return _ensure_fee_cols(df_pos)
+
+# ========= Parsing MT4 (HTML) — Comment como robot (limpia [tp]/[sl]/[s]) =========
+def parse_mt4_html_use_comment(html_bytes: bytes) -> pd.DataFrame:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    rows = soup.find_all("tr", attrs={"align": "right"})
+    data = []
+
+    for tr in rows:
+        tds = tr.find_all("td")
+        if len(tds) < 14:
+            continue
+
+        profit_txt = tds[13].get_text(strip=True)
+        try:
+            profit_val = float(profit_txt.replace(",", ""))
+        except ValueError:
+            continue
+
+        ticket_td = tds[0]
+        ticket = ticket_td.get_text(strip=True)
+        comment = ""
+        title_attr = ticket_td.get("title")
+        if title_attr:
+            m = re.match(r"#\s*\d+\s*(.*)", title_attr.strip(), flags=re.I)
+            if m:
+                comment = m.group(1).strip()
+                comment = re.sub(r"\[.*?\]$", "", comment).strip()
+
+        def to_float(x):
+            try:
+                return float(str(x).replace(",", ""))
+            except Exception:
+                return np.nan
+
+        def to_time(x):
+            return pd.to_datetime(x, errors="coerce")
+
+        open_time = to_time(tds[1].get_text(strip=True))
+        typ = tds[2].get_text(strip=True)
+        volume = to_float(tds[3].get_text(strip=True))
+        symbol = tds[4].get_text(strip=True)
+        open_price = to_float(tds[5].get_text(strip=True))
+        sl = to_float(tds[6].get_text(strip=True))
+        tp = to_float(tds[7].get_text(strip=True))
+        close_time = to_time(tds[8].get_text(strip=True))
+        close_price = to_float(tds[9].get_text(strip=True))
+        commission = to_float(tds[10].get_text(strip=True))
+        swap = to_float(tds[12].get_text(strip=True))
+        profit = profit_val
+
+        data.append({
+            "open_time": open_time,
+            "close_time": close_time,
+            "position": pd.to_numeric(ticket, errors="coerce"),
+            "symbol": symbol,
+            "type": typ,
+            "volume": volume,
+            "open_price": open_price,
+            "sl": sl,
+            "tp": tp,
+            "close_price": close_price,
+            "commission": commission,
+            "swap": swap,
+            "profit": profit,
+            "robot_id": comment if comment else symbol + "_UNKNOWN"
+        })
+
+    df = pd.DataFrame(data)
+    if not df.empty:
+        for c in ["open_time", "close_time"]:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+        for c in ["position","volume","open_price","close_price","sl","tp","commission","swap","profit"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["symbol"] = df["symbol"].astype(str)
+        df["robot_id"] = df["robot_id"].astype(str)
+
+    return _ensure_fee_cols(df)
+
+# ========= KPIs (comunes; usan real_profit) =========
 def kpis_por_robot(df_pos: pd.DataFrame):
     key = "robot_id"
     df = df_pos.copy()
@@ -201,78 +302,80 @@ def kpis_por_robot(df_pos: pd.DataFrame):
 
     rows = []
     for rid, g in df.groupby(key):
-        pnl = g["profit"].fillna(0.0)
-        equity = pnl.cumsum()
+        pnl_real = g["real_profit"].fillna(0.0)
+        equity = pnl_real.cumsum()
         rows.append({
             "Robot (Comment)": rid,
-            "Net profit": pnl.sum(),
-            "# Trades": int((~pnl.isna()).sum()),
-            "% Wins": float((pnl > 0).mean() * 100.0) if len(pnl) else 0.0,
-            "PF": profit_factor(pnl),
-            "Expectancy": expectancy(pnl),
+            "Net profit (bruto)": g["profit"].sum(),     # solo Profit
+            "Net profit (real)": pnl_real.sum(),         # Profit + Commission + Swap
+            "# Trades": int((~pnl_real.isna()).sum()),
+            "% Wins": float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0,
+            "PF": profit_factor(pnl_real),
+            "Expectancy": expectancy(pnl_real),
             "Max DD": max_drawdown(equity),
             "Desde": g[tcol].min(),
             "Hasta": g[tcol].max(),
             "Símbolos": ", ".join(sorted(set(g["symbol"].dropna().astype(str)))) if "symbol" in g else "",
         })
-    out = pd.DataFrame(rows).sort_values("Net profit", ascending=False)
+    out = pd.DataFrame(rows).sort_values("Net profit (real)", ascending=False)
     return out, key, tcol
 
 def summary_kpis_robot(g: pd.DataFrame, tcol: str) -> pd.DataFrame:
-    pnl = g["profit"].fillna(0.0)
-    equity = pnl.cumsum()
-    wins = int((pnl > 0).sum())
-    losses = int((pnl < 0).sum())
+    pnl_real = g["real_profit"].fillna(0.0)
+    equity = pnl_real.cumsum()
+    wins = int((pnl_real > 0).sum())
+    losses = int((pnl_real < 0).sum())
     mdd = max_drawdown(equity)
-    net = float(pnl.sum())
-    ret_dd = float(net / mdd) if mdd > 0 else np.nan
-    sharp = sharpe_per_trade(pnl)
+    net_bruto = float(g["profit"].sum())
+    comm_total = float(g["commission"].sum())
+    swap_total = float(g["swap"].sum())
+    net_real = float(pnl_real.sum())
+    ret_dd = float(net_real / mdd) if mdd > 0 else np.nan
+    sharp = sharpe_per_trade(pnl_real)
     stab = stability_r2(equity)
     stagn = max_stagnation(g[tcol] if tcol in g.columns else None, equity)
 
     data = {
         "comment": [g["robot_id"].iloc[0] if "robot_id" in g.columns else ""],
-        "trades": [int(len(pnl))],
-        "net profit": [net],
+        "trades": [int(len(pnl_real))],
+        "net profit (bruto)": [net_bruto],
+        "commissions total": [comm_total],
+        "swaps total": [swap_total],
+        "net profit (real)": [net_real],
         "max dd": [mdd],
         "ret/dd": [ret_dd],
-        "winrate": [float((pnl > 0).mean() * 100.0) if len(pnl) else 0.0],
+        "winrate": [float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0],
         "wins": [wins],
         "loss": [losses],
-        "profit factor": [profit_factor(pnl)],
+        "profit factor": [profit_factor(pnl_real)],
         "sharpe ratio": [sharp],
-        "expectancy": [expectancy(pnl)],
+        "expectancy": [expectancy(pnl_real)],
         "stability": [stab],
         "stagnation": [stagn],
     }
     return pd.DataFrame(data)
 
 # ========= UI =========
-uploaded = st.file_uploader("📥 Subí tu archivo (.xlsx de MT5 o .csv)", type=["xlsx","csv"])
+uploaded = st.file_uploader("📥 Subí tu archivo (MT5: .xlsx/.csv | MT4: .htm/.html)", type=["xlsx","csv","htm","html"])
 if not uploaded:
-    st.info("Cargá un archivo de **MetaTrader (.xlsx)** o **CSV** para comenzar.")
+    st.info("Cargá un archivo de **MetaTrader 5 (.xlsx/.csv)** o **MetaTrader 4 (.htm/.html)** para comenzar.")
     st.stop()
 
 suffix = uploaded.name.lower().split(".")[-1]
 try:
     if suffix == "xlsx":
         df_pos = parse_mt5_xlsx_use_comment(uploaded.read())
+    elif suffix == "csv":
+        df_pos = parse_csv_use_comment(uploaded)
+    elif suffix in ("htm", "html"):
+        df_pos = parse_mt4_html_use_comment(uploaded.read())
     else:
-        df_pos = pd.read_csv(uploaded)
-        # Normalización mínima para CSV: usar 'Comment' como robot_id
-        rename_try = {
-            'Open Time':'open_time','Close Time':'close_time','Symbol':'symbol','Type':'type',
-            'Volume':'volume','Open Price':'open_price','Close Price':'close_price',
-            'Commission':'commission','Swap':'swap','Profit':'profit',
-            'Comment':'robot_id'
-        }
-        df_pos = df_pos.rename(columns={k:v for k,v in rename_try.items() if k in df_pos.columns})
-        for c in ['open_time','close_time']:
-            if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
-        for c in ['volume','open_price','close_price','commission','swap','profit']:
-            if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
-        if 'robot_id' not in df_pos.columns:
-            df_pos['robot_id'] = "UNKNOWN"
+        st.error("Extensión no soportada."); st.stop()
+
+    if df_pos.empty:
+        st.warning("No se encontraron operaciones cerradas con Profit numérico.")
+        st.stop()
+
 except Exception as e:
     st.error("No se pudo leer el archivo. Verificá el formato/export.")
     st.exception(e)
@@ -281,11 +384,12 @@ except Exception as e:
 # ====== Resultados ======
 kpis_df, key_used, tcol = kpis_por_robot(df_pos)
 
-# Tabla general con formatting (2 decimales, winrate en %)
+# Tabla general (2 decimales; winrate en %)
 st.subheader("📊 KPIs por Robot (agrupado por Comment)")
 st.dataframe(
     kpis_df.style.format({
-        "Net profit": "{:.2f}",
+        "Net profit (bruto)": "{:.2f}",
+        "Net profit (real)": "{:.2f}",
         "% Wins": "{:.2f}%",
         "PF": "{:.2f}",
         "Expectancy": "{:.2f}",
@@ -294,9 +398,9 @@ st.dataframe(
     use_container_width=True
 )
 
-# Curva de equity (diaria, consolidada al último valor por día)
+# Curva de equity (diaria consolidada) usando PnL REAL
 st.subheader("🔎 Curva de equity por robot")
-robots = kpis_df['Robot (Comment)'].astype(str).tolist()
+robots = sorted(kpis_df['Robot (Comment)'].astype(str).unique())
 selected = st.selectbox("Elegí un robot", robots)
 
 if selected:
@@ -304,24 +408,23 @@ if selected:
     g['robot_id'] = g['robot_id'].astype(str)
     sel = g[g['robot_id'] == str(selected)].sort_values(tcol)
 
-    pnl = sel['profit'].fillna(0.0)
-    equity_cum = pnl.cumsum()
+    pnl_real = sel['real_profit'].fillna(0.0)
+    equity_cum = pnl_real.cumsum()
 
-    # Columna de tiempo y consolidación diaria (último valor por día)
     dates = sel[tcol].dt.floor("D") if tcol in sel.columns else None
-    if dates is not None:
-        equity_daily = pd.Series(equity_cum.values, index=dates).groupby(level=0).last()
-    else:
-        equity_daily = equity_cum  # fallback por si faltara fecha
+    equity_daily = pd.Series(equity_cum.values, index=dates).groupby(level=0).last() if dates is not None else equity_cum
 
     st.line_chart(equity_daily, height=280)
-    st.caption("Equity acumulada (último valor por día) del robot seleccionado.")
+    st.caption("Equity acumulada (último valor por día, PnL real) del robot seleccionado.")
 
-    # KPIs del robot seleccionado (2 decimales, winrate en %)
+    # KPIs del robot (2 decimales; winrate en %)
     st.markdown("### 📐 KPIs del robot seleccionado")
     st.dataframe(
         summary_kpis_robot(sel, tcol).style.format({
-            "net profit": "{:.2f}",
+            "net profit (bruto)": "{:.2f}",
+            "commissions total": "{:.2f}",
+            "swaps total": "{:.2f}",
+            "net profit (real)": "{:.2f}",
             "max dd": "{:.2f}",
             "ret/dd": "{:.2f}",
             "winrate": "{:.2f}%",
