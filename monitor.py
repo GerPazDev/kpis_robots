@@ -207,7 +207,7 @@ def parse_csv_use_comment(uploaded_csv: BytesIO) -> pd.DataFrame:
     }
     df_pos = df_pos.rename(columns={k:v for k,v in rename_try.items() if k in df_pos.columns})
     for c in ['open_time','close_time']:
-        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
+        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df[c], errors='coerce')
     for c in ['volume','open_price','close_price','commission','swap','profit']:
         if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
     if 'robot_id' not in df_pos.columns:
@@ -306,8 +306,8 @@ def kpis_por_robot(df_pos: pd.DataFrame):
         equity = pnl_real.cumsum()
         rows.append({
             "Robot (Comment)": rid,
-            "Net profit (bruto)": g["profit"].sum(),     # solo Profit
-            "Net profit (real)": pnl_real.sum(),         # Profit + Commission + Swap
+            "Net profit (bruto)": g["profit"].sum(),
+            "Net profit (real)": pnl_real.sum(),
             "# Trades": int((~pnl_real.isna()).sum()),
             "% Wins": float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0,
             "PF": profit_factor(pnl_real),
@@ -398,24 +398,39 @@ st.dataframe(
     use_container_width=True
 )
 
-# Curva de equity (diaria consolidada) usando PnL REAL
-st.subheader("🔎 Curva de equity por robot")
+# ====== Equity por TRADE (reemplaza gráfico diario) ======
+st.subheader("🔎 Curva de equity por trade (PnL real)")
 robots = sorted(kpis_df['Robot (Comment)'].astype(str).unique())
 selected = st.selectbox("Elegí un robot", robots)
 
 if selected:
     g = df_pos.copy()
     g['robot_id'] = g['robot_id'].astype(str)
-    sel = g[g['robot_id'] == str(selected)].sort_values(tcol)
+    sel = g[g['robot_id'] == str(selected)].copy()
 
-    pnl_real = sel['real_profit'].fillna(0.0)
-    equity_cum = pnl_real.cumsum()
+    # Orden determinista de trades
+    orden_cols = []
+    if tcol in sel.columns:
+        orden_cols.append(tcol)
+    # agregar las otras fechas para desempatar
+    if "close_time" in sel.columns and "close_time" != tcol:
+        orden_cols.append("close_time")
+    if "open_time" in sel.columns and "open_time" != tcol:
+        orden_cols.append("open_time")
+    if "position" in sel.columns:
+        orden_cols.append("position")
 
-    dates = sel[tcol].dt.floor("D") if tcol in sel.columns else None
-    equity_daily = pd.Series(equity_cum.values, index=dates).groupby(level=0).last() if dates is not None else equity_cum
+    sel = sel.sort_values(orden_cols if orden_cols else [tcol], kind="mergesort")
 
-    st.line_chart(equity_daily, height=280)
-    st.caption("Equity acumulada (último valor por día, PnL real) del robot seleccionado.")
+    # PnL por trade y equity acumulada por trade
+    sel["pnl_real"] = sel["real_profit"].fillna(0.0)
+    sel["#"] = np.arange(1, len(sel) + 1)
+    sel["equity_trade"] = sel["pnl_real"].cumsum()
+
+    # Gráfico por trade
+    serie_equity_trade = pd.Series(sel["equity_trade"].values, index=sel["#"])
+    st.line_chart(serie_equity_trade, height=280)
+    st.caption("Equity acumulada por operación (secuencia de trades).")
 
     # KPIs del robot (2 decimales; winrate en %)
     st.markdown("### 📐 KPIs del robot seleccionado")
@@ -434,4 +449,93 @@ if selected:
             "stability": "{:.2f}"
         }),
         use_container_width=True
+    )
+
+    # =========================
+    # 🧾 Historial de trades
+    # =========================
+    st.markdown("### 🧾 Historial de trades del robot seleccionado")
+
+    # Filtros rápidos
+    with st.expander("Filtros", expanded=False):
+        min_dt = pd.to_datetime(sel[tcol].min()) if (tcol in sel.columns and not sel.empty) else None
+        max_dt = pd.to_datetime(sel[tcol].max()) if (tcol in sel.columns and not sel.empty) else None
+        c1, c2, c3, c4 = st.columns([1,1,1,1])
+
+        if (min_dt is not None) and (max_dt is not None):
+            f_ini = c1.date_input("Desde", value=min_dt.date(), min_value=min_dt.date(), max_value=max_dt.date())
+            f_fin = c2.date_input("Hasta", value=max_dt.date(), min_value=min_dt.date(), max_value=max_dt.date())
+        else:
+            f_ini, f_fin = None, None
+
+        syms = sorted(sel["symbol"].dropna().astype(str).unique()) if "symbol" in sel.columns else []
+        sym_pick = c3.multiselect("Símbolos", syms, default=syms)
+        resultado = c4.selectbox("Resultado", ["Todos", "Ganadores", "Perdedores"])
+
+    # Preparación del historial (partimos de 'sel' ya ordenado)
+    hist = sel.copy()
+    hist["pnl_real"] = hist["real_profit"].fillna(0.0)
+
+    # Aplicar filtros
+    if f_ini and f_fin and (tcol in hist.columns):
+        mask_fecha = (hist[tcol].dt.date >= f_ini) & (hist[tcol].dt.date <= f_fin)
+        hist = hist[mask_fecha]
+    if sym_pick and "symbol" in hist.columns:
+        hist = hist[hist["symbol"].astype(str).isin(sym_pick)]
+    if resultado == "Ganadores":
+        hist = hist[hist["pnl_real"] > 0]
+    elif resultado == "Perdedores":
+        hist = hist[hist["pnl_real"] < 0]
+
+    # Equity acumulada (sobre el subconjunto filtrado)
+    hist = hist.sort_values(orden_cols if orden_cols else [tcol], kind="mergesort")
+    hist["equity_cum"] = hist["pnl_real"].cumsum()
+    hist["#"] = np.arange(1, len(hist) + 1)
+
+    # Columnas amigables para mostrar (sin duplicados)
+    columnas = ["#"]
+    if tcol in hist.columns:
+        columnas.append(tcol)
+    otra_time = "open_time" if tcol == "close_time" else "close_time"
+    if otra_time in hist.columns and otra_time != tcol:
+        columnas.append(otra_time)
+
+    for col in ["symbol", "type", "volume", "open_price", "close_price",
+                "commission", "swap", "profit", "pnl_real", "equity_cum",
+                "position", "robot_id"]:
+        if col in hist.columns:
+            columnas.append(col)
+
+    columnas = list(dict.fromkeys(columnas))
+    hist_view = hist[columnas].copy()
+
+    # Blindaje extra si algún export trae nombres repetidos
+    if hist_view.columns.duplicated().any():
+        hist_view.columns = pd.io.parsers.ParserBase({'names': hist_view.columns})._maybe_dedup_names(hist_view.columns)
+
+    # Formato numérico
+    fmt_nums = {
+        "volume": "{:.2f}",
+        "open_price": "{:.5f}",
+        "close_price": "{:.5f}",
+        "commission": "{:.2f}",
+        "swap": "{:.2f}",
+        "profit": "{:.2f}",
+        "pnl_real": "{:.2f}",
+        "equity_cum": "{:.2f}",
+    }
+
+    st.dataframe(
+        hist_view.style.format(fmt_nums),
+        use_container_width=True,
+        height=380
+    )
+
+    # Descargar CSV del historial filtrado
+    csv = hist_view.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Descargar historial (CSV)",
+        data=csv,
+        file_name=f"historial_{str(selected).replace(' ','_')}.csv",
+        mime="text/csv"
     )
