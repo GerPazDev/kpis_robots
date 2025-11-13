@@ -137,20 +137,28 @@ def parse_mt5_xlsx_use_comment(xlsx_bytes: bytes, time_tolerance="10min", vol_to
     df_pos = df_pos.rename(columns=rename_map)
 
     for c in ["open_time", "close_time"]:
-        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors="coerce")
+        if c in df_pos.columns:
+            df_pos[c] = pd.to_datetime(df_pos[c], errors="coerce")
     for c in ["position","volume","open_price","close_price","sl","tp","commission","swap","profit"]:
-        if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors="coerce")
-    if "symbol" in df_pos.columns: df_pos["symbol"] = df_pos["symbol"].astype(str)
-    if "profit" in df_pos.columns: df_pos = df_pos[~df_pos["profit"].isna()].copy()
+        if c in df_pos.columns:
+            df_pos[c] = pd.to_numeric(df_pos[c], errors="coerce")
+    if "symbol" in df_pos.columns:
+        df_pos["symbol"] = df_pos["symbol"].astype(str)
+    if "profit" in df_pos.columns:
+        df_pos = df_pos[~df_pos["profit"].isna()].copy()
 
     # DEALS
     deals_headers = df_raw.iloc[deals_header].tolist()
     df_deals = df_raw.iloc[deals_header + 1 :].copy()
     df_deals.columns = deals_headers
-    if "Order" in df_deals.columns: df_deals["Order"] = pd.to_numeric(df_deals["Order"], errors="coerce")
-    if "Time" in df_deals.columns: df_deals["Time"] = pd.to_datetime(df_deals["Time"], errors="coerce")
-    if "Volume" in df_deals.columns: df_deals["Volume"] = pd.to_numeric(df_deals["Volume"], errors="coerce")
-    if "Symbol" in df_deals.columns: df_deals["Symbol"] = df_deals["Symbol"].astype(str)
+    if "Order" in df_deals.columns:
+        df_deals["Order"] = pd.to_numeric(df_deals["Order"], errors="coerce")
+    if "Time" in df_deals.columns:
+        df_deals["Time"] = pd.to_datetime(df_deals["Time"], errors="coerce")
+    if "Volume" in df_deals.columns:
+        df_deals["Volume"] = pd.to_numeric(df_deals["Volume"], errors="coerce")
+    if "Symbol" in df_deals.columns:
+        df_deals["Symbol"] = df_deals["Symbol"].astype(str)
 
     # 1) Map directo por Order→Comment (deal 'in')
     robot_map = {}
@@ -205,11 +213,13 @@ def parse_csv_use_comment(uploaded_csv: BytesIO) -> pd.DataFrame:
         'Commission':'commission','Swap':'swap','Profit':'profit',
         'Comment':'robot_id'
     }
-    df_pos = df_pos.rename(columns={k:v for k,v in rename_try.items() if k in df_pos.columns})
+    df_pos = df_pos.rename(columns={k: v for k, v in rename_try.items() if k in df_pos.columns})
     for c in ['open_time','close_time']:
-        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df[c], errors='coerce')
+        if c in df_pos.columns:
+            df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
     for c in ['volume','open_price','close_price','commission','swap','profit']:
-        if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
+        if c in df_pos.columns:
+            df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
     if 'robot_id' not in df_pos.columns:
         df_pos['robot_id'] = "UNKNOWN"
     return _ensure_fee_cols(df_pos)
@@ -304,15 +314,19 @@ def kpis_por_robot(df_pos: pd.DataFrame):
     for rid, g in df.groupby(key):
         pnl_real = g["real_profit"].fillna(0.0)
         equity = pnl_real.cumsum()
+        mdd = max_drawdown(equity)
+        net_real = float(pnl_real.sum())
+        ret_dd = float(net_real / mdd) if mdd > 0 else np.nan
+
         rows.append({
             "Robot (Comment)": rid,
-            "Net profit (bruto)": g["profit"].sum(),
-            "Net profit (real)": pnl_real.sum(),
+            "Net profit (real)": net_real,
             "# Trades": int((~pnl_real.isna()).sum()),
             "% Wins": float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0,
             "PF": profit_factor(pnl_real),
             "Expectancy": expectancy(pnl_real),
-            "Max DD": max_drawdown(equity),
+            "Ret/DD": ret_dd,
+            "Max DD": mdd,
             "Desde": g[tcol].min(),
             "Hasta": g[tcol].max(),
             "Símbolos": ", ".join(sorted(set(g["symbol"].dropna().astype(str)))) if "symbol" in g else "",
@@ -388,12 +402,12 @@ kpis_df, key_used, tcol = kpis_por_robot(df_pos)
 st.subheader("📊 KPIs por Robot (agrupado por Comment)")
 st.dataframe(
     kpis_df.style.format({
-        "Net profit (bruto)": "{:.2f}",
         "Net profit (real)": "{:.2f}",
         "% Wins": "{:.2f}%",
         "PF": "{:.2f}",
         "Expectancy": "{:.2f}",
-        "Max DD": "{:.2f}"
+        "Ret/DD": "{:.2f}",
+        "Max DD": "{:.2f}",
     }),
     use_container_width=True
 )
@@ -412,7 +426,6 @@ if selected:
     orden_cols = []
     if tcol in sel.columns:
         orden_cols.append(tcol)
-    # agregar las otras fechas para desempatar
     if "close_time" in sel.columns and "close_time" != tcol:
         orden_cols.append("close_time")
     if "open_time" in sel.columns and "open_time" != tcol:
@@ -446,7 +459,7 @@ if selected:
             "profit factor": "{:.2f}",
             "sharpe ratio": "{:.2f}",
             "expectancy": "{:.2f}",
-            "stability": "{:.2f}"
+            "stability": "{:.2f}",
         }),
         use_container_width=True
     )
@@ -511,7 +524,8 @@ if selected:
 
     # Blindaje extra si algún export trae nombres repetidos
     if hist_view.columns.duplicated().any():
-        hist_view.columns = pd.io.parsers.ParserBase({'names': hist_view.columns})._maybe_dedup_names(hist_view.columns)
+        from pandas.io.parsers import ParserBase
+        hist_view.columns = ParserBase({'names': hist_view.columns})._maybe_dedup_names(hist_view.columns)
 
     # Formato numérico
     fmt_nums = {
