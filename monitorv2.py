@@ -137,28 +137,20 @@ def parse_mt5_xlsx_use_comment(xlsx_bytes: bytes, time_tolerance="10min", vol_to
     df_pos = df_pos.rename(columns=rename_map)
 
     for c in ["open_time", "close_time"]:
-        if c in df_pos.columns:
-            df_pos[c] = pd.to_datetime(df_pos[c], errors="coerce")
+        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors="coerce")
     for c in ["position","volume","open_price","close_price","sl","tp","commission","swap","profit"]:
-        if c in df_pos.columns:
-            df_pos[c] = pd.to_numeric(df_pos[c], errors="coerce")
-    if "symbol" in df_pos.columns:
-        df_pos["symbol"] = df_pos["symbol"].astype(str)
-    if "profit" in df_pos.columns:
-        df_pos = df_pos[~df_pos["profit"].isna()].copy()
+        if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors="coerce")
+    if "symbol" in df_pos.columns: df_pos["symbol"] = df_pos["symbol"].astype(str)
+    if "profit" in df_pos.columns: df_pos = df_pos[~df_pos["profit"].isna()].copy()
 
     # DEALS
     deals_headers = df_raw.iloc[deals_header].tolist()
     df_deals = df_raw.iloc[deals_header + 1 :].copy()
     df_deals.columns = deals_headers
-    if "Order" in df_deals.columns:
-        df_deals["Order"] = pd.to_numeric(df_deals["Order"], errors="coerce")
-    if "Time" in df_deals.columns:
-        df_deals["Time"] = pd.to_datetime(df_deals["Time"], errors="coerce")
-    if "Volume" in df_deals.columns:
-        df_deals["Volume"] = pd.to_numeric(df_deals["Volume"], errors="coerce")
-    if "Symbol" in df_deals.columns:
-        df_deals["Symbol"] = df_deals["Symbol"].astype(str)
+    if "Order" in df_deals.columns: df_deals["Order"] = pd.to_numeric(df_deals["Order"], errors="coerce")
+    if "Time" in df_deals.columns: df_deals["Time"] = pd.to_datetime(df_deals["Time"], errors="coerce")
+    if "Volume" in df_deals.columns: df_deals["Volume"] = pd.to_numeric(df_deals["Volume"], errors="coerce")
+    if "Symbol" in df_deals.columns: df_deals["Symbol"] = df_deals["Symbol"].astype(str)
 
     # 1) Map directo por Order→Comment (deal 'in')
     robot_map = {}
@@ -213,13 +205,11 @@ def parse_csv_use_comment(uploaded_csv: BytesIO) -> pd.DataFrame:
         'Commission':'commission','Swap':'swap','Profit':'profit',
         'Comment':'robot_id'
     }
-    df_pos = df_pos.rename(columns={k: v for k, v in rename_try.items() if k in df_pos.columns})
+    df_pos = df_pos.rename(columns={k:v for k,v in rename_try.items() if k in df_pos.columns})
     for c in ['open_time','close_time']:
-        if c in df_pos.columns:
-            df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
+        if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
     for c in ['volume','open_price','close_price','commission','swap','profit']:
-        if c in df_pos.columns:
-            df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
+        if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
     if 'robot_id' not in df_pos.columns:
         df_pos['robot_id'] = "UNKNOWN"
     return _ensure_fee_cols(df_pos)
@@ -314,19 +304,15 @@ def kpis_por_robot(df_pos: pd.DataFrame):
     for rid, g in df.groupby(key):
         pnl_real = g["real_profit"].fillna(0.0)
         equity = pnl_real.cumsum()
-        mdd = max_drawdown(equity)
-        net_real = float(pnl_real.sum())
-        ret_dd = float(net_real / mdd) if mdd > 0 else np.nan
-
         rows.append({
             "Robot (Comment)": rid,
-            "Net profit (real)": net_real,
+            "Net profit (bruto)": g["profit"].sum(),     # solo Profit
+            "Net profit (real)": pnl_real.sum(),         # Profit + Commission + Swap
             "# Trades": int((~pnl_real.isna()).sum()),
             "% Wins": float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0,
             "PF": profit_factor(pnl_real),
             "Expectancy": expectancy(pnl_real),
-            "Ret/DD": ret_dd,
-            "Max DD": mdd,
+            "Max DD": max_drawdown(equity),
             "Desde": g[tcol].min(),
             "Hasta": g[tcol].max(),
             "Símbolos": ", ".join(sorted(set(g["symbol"].dropna().astype(str)))) if "symbol" in g else "",
@@ -369,150 +355,70 @@ def summary_kpis_robot(g: pd.DataFrame, tcol: str) -> pd.DataFrame:
     }
     return pd.DataFrame(data)
 
-# ==========================================
-# ⚙️ SIDEBAR: Controles y Filtros Globales
-# ==========================================
-st.sidebar.header("📁 Carga de Datos")
-
-uploaded_files = st.sidebar.file_uploader(
-    "📥 Subí tus archivos (MT5: .xlsx/.csv | MT4: .htm/.html)", 
-    type=["xlsx","csv","htm","html"], 
-    accept_multiple_files=True
-)
-
-if not uploaded_files:
-    st.info("👈 Por favor, arrastrá y soltá tus historiales en la barra lateral para comenzar.")
+# ========= UI =========
+uploaded = st.file_uploader("📥 Subí tu archivo (MT5: .xlsx/.csv | MT4: .htm/.html)", type=["xlsx","csv","htm","html"])
+if not uploaded:
+    st.info("Cargá un archivo de **MetaTrader 5 (.xlsx/.csv)** o **MetaTrader 4 (.htm/.html)** para comenzar.")
     st.stop()
 
-st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Configuración")
+suffix = uploaded.name.lower().split(".")[-1]
+try:
+    if suffix == "xlsx":
+        df_pos = parse_mt5_xlsx_use_comment(uploaded.read())
+    elif suffix == "csv":
+        df_pos = parse_csv_use_comment(uploaded)
+    elif suffix in ("htm", "html"):
+        df_pos = parse_mt4_html_use_comment(uploaded.read())
+    else:
+        st.error("Extensión no soportada."); st.stop()
 
-fusionar_archivos = st.sidebar.checkbox(
-    "🔗 Fusionar historiales del mismo robot", 
-    value=False, 
-    help="Si activado, suma los trades de robots con el mismo nombre en diferentes archivos."
-)
+    if df_pos.empty:
+        st.warning("No se encontraron operaciones cerradas con Profit numérico.")
+        st.stop()
 
-all_dfs = []
-
-# Procesamiento de Archivos
-for uploaded in uploaded_files:
-    suffix = uploaded.name.lower().split(".")[-1]
-    try:
-        if suffix == "xlsx":
-            df_temp = parse_mt5_xlsx_use_comment(uploaded.read())
-        elif suffix == "csv":
-            df_temp = parse_csv_use_comment(uploaded)
-        elif suffix in ("htm", "html"):
-            df_temp = parse_mt4_html_use_comment(uploaded.read())
-        else:
-            st.sidebar.error(f"Extensión no soportada: {uploaded.name}")
-            continue
-
-        if df_temp.empty:
-            st.sidebar.warning(f"No hay operaciones válidas en {uploaded.name}.")
-            continue
-
-        if not fusionar_archivos:
-            # Añadimos el nombre del archivo para diferenciar si no queremos fusionar
-            df_temp["robot_id"] = df_temp["robot_id"].astype(str) + f" [{uploaded.name}]"
-        
-        # Guardamos el origen para que sea visible en la tabla de historial
-        df_temp["source_file"] = uploaded.name
-        
-        all_dfs.append(df_temp)
-
-    except Exception as e:
-        st.sidebar.error(f"No se pudo leer {uploaded.name}. Verificá el formato.")
-        st.sidebar.exception(e)
-
-if not all_dfs:
+except Exception as e:
+    st.error("No se pudo leer el archivo. Verificá el formato/export.")
+    st.exception(e)
     st.stop()
 
-# Unimos todos los DataFrames
-df_pos_full = pd.concat(all_dfs, ignore_index=True)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🔎 Filtros Globales")
-
-# Extraemos todos los símbolos disponibles
-all_symbols = sorted(df_pos_full["symbol"].dropna().astype(str).unique())
-
-selected_symbols = st.sidebar.multiselect(
-    "Filtrar por Símbolo(s)", 
-    options=all_symbols, 
-    default=all_symbols,
-    help="Los KPIs y gráficos se calcularán SOLO con los trades de estos símbolos."
-)
-
-# Aplicamos filtro global
-if not selected_symbols:
-    st.warning("⚠️ Debes seleccionar al menos un símbolo en la barra lateral para ver resultados.")
-    st.stop()
-
-df_pos = df_pos_full[df_pos_full["symbol"].isin(selected_symbols)].copy()
-
-if df_pos.empty:
-    st.warning("No hay operaciones para los símbolos seleccionados.")
-    st.stop()
-
-# ==========================================
-# 📈 MAIN AREA: Resultados y Gráficos
-# ==========================================
-
+# ====== Resultados ======
 kpis_df, key_used, tcol = kpis_por_robot(df_pos)
 
-# Tabla general
-st.subheader("📊 KPIs por Robot (Filtrado por símbolo)")
+# Tabla general (2 decimales; winrate en %)
+st.subheader("📊 KPIs por Robot (agrupado por Comment)")
 st.dataframe(
     kpis_df.style.format({
+        "Net profit (bruto)": "{:.2f}",
         "Net profit (real)": "{:.2f}",
         "% Wins": "{:.2f}%",
         "PF": "{:.2f}",
         "Expectancy": "{:.2f}",
-        "Ret/DD": "{:.2f}",
-        "Max DD": "{:.2f}",
+        "Max DD": "{:.2f}"
     }),
     use_container_width=True
 )
 
-st.markdown("---")
-
-# ====== Equity por TRADE ======
-st.subheader("🔎 Curva de equity por trade (PnL real)")
+# Curva de equity (diaria consolidada) usando PnL REAL
+st.subheader("🔎 Curva de equity por robot")
 robots = sorted(kpis_df['Robot (Comment)'].astype(str).unique())
-selected = st.selectbox("Seleccioná un robot para analizar a fondo:", robots)
+selected = st.selectbox("Elegí un robot", robots)
 
 if selected:
     g = df_pos.copy()
     g['robot_id'] = g['robot_id'].astype(str)
-    sel = g[g['robot_id'] == str(selected)].copy()
+    sel = g[g['robot_id'] == str(selected)].sort_values(tcol)
 
-    # Orden determinista de trades
-    orden_cols = []
-    if tcol in sel.columns:
-        orden_cols.append(tcol)
-    if "close_time" in sel.columns and "close_time" != tcol:
-        orden_cols.append("close_time")
-    if "open_time" in sel.columns and "open_time" != tcol:
-        orden_cols.append("open_time")
-    if "position" in sel.columns:
-        orden_cols.append("position")
+    pnl_real = sel['real_profit'].fillna(0.0)
+    equity_cum = pnl_real.cumsum()
 
-    sel = sel.sort_values(orden_cols if orden_cols else [tcol], kind="mergesort")
+    dates = sel[tcol].dt.floor("D") if tcol in sel.columns else None
+    equity_daily = pd.Series(equity_cum.values, index=dates).groupby(level=0).last() if dates is not None else equity_cum
 
-    # PnL por trade y equity acumulada por trade
-    sel["pnl_real"] = sel["real_profit"].fillna(0.0)
-    sel["#"] = np.arange(1, len(sel) + 1)
-    sel["equity_trade"] = sel["pnl_real"].cumsum()
+    st.line_chart(equity_daily, height=280)
+    st.caption("Equity acumulada (último valor por día, PnL real) del robot seleccionado.")
 
-    # Gráfico por trade
-    serie_equity_trade = pd.Series(sel["equity_trade"].values, index=sel["#"])
-    st.line_chart(serie_equity_trade, height=280)
-    st.caption(f"Equity acumulada ({', '.join(selected_symbols)}) por operación.")
-
-    # KPIs del robot
-    st.markdown("### 📐 KPIs del robot seleccionado (Símbolos filtrados)")
+    # KPIs del robot (2 decimales; winrate en %)
+    st.markdown("### 📐 KPIs del robot seleccionado")
     st.dataframe(
         summary_kpis_robot(sel, tcol).style.format({
             "net profit (bruto)": "{:.2f}",
@@ -525,90 +431,7 @@ if selected:
             "profit factor": "{:.2f}",
             "sharpe ratio": "{:.2f}",
             "expectancy": "{:.2f}",
-            "stability": "{:.2f}",
+            "stability": "{:.2f}"
         }),
         use_container_width=True
-    )
-
-    # =========================
-    # 🧾 Historial de trades
-    # =========================
-    st.markdown("### 🧾 Historial de trades")
-
-    with st.expander("Filtros de historial (Aplica solo a esta tabla)", expanded=False):
-        min_dt = pd.to_datetime(sel[tcol].min()) if (tcol in sel.columns and not sel.empty) else None
-        max_dt = pd.to_datetime(sel[tcol].max()) if (tcol in sel.columns and not sel.empty) else None
-        c1, c2, c3 = st.columns([1,1,1])
-
-        if (min_dt is not None) and (max_dt is not None):
-            f_ini = c1.date_input("Desde", value=min_dt.date(), min_value=min_dt.date(), max_value=max_dt.date())
-            f_fin = c2.date_input("Hasta", value=max_dt.date(), min_value=min_dt.date(), max_value=max_dt.date())
-        else:
-            f_ini, f_fin = None, None
-
-        resultado = c3.selectbox("Resultado de la operación", ["Todos", "Ganadores", "Perdedores"])
-
-    # Preparación del historial
-    hist = sel.copy()
-    hist["pnl_real"] = hist["real_profit"].fillna(0.0)
-
-    # Aplicar filtros locales
-    if f_ini and f_fin and (tcol in hist.columns):
-        mask_fecha = (hist[tcol].dt.date >= f_ini) & (hist[tcol].dt.date <= f_fin)
-        hist = hist[mask_fecha]
-    
-    if resultado == "Ganadores":
-        hist = hist[hist["pnl_real"] > 0]
-    elif resultado == "Perdedores":
-        hist = hist[hist["pnl_real"] < 0]
-
-    # Equity acumulada (sobre el subconjunto filtrado visualmente)
-    hist = hist.sort_values(orden_cols if orden_cols else [tcol], kind="mergesort")
-    hist["equity_cum"] = hist["pnl_real"].cumsum()
-    hist["#"] = np.arange(1, len(hist) + 1)
-
-    # Columnas a mostrar
-    columnas = ["#"]
-    if tcol in hist.columns:
-        columnas.append(tcol)
-    otra_time = "open_time" if tcol == "close_time" else "close_time"
-    if otra_time in hist.columns and otra_time != tcol:
-        columnas.append(otra_time)
-
-    for col in ["symbol", "type", "volume", "open_price", "close_price",
-                "commission", "swap", "profit", "pnl_real", "equity_cum",
-                "position", "robot_id", "source_file"]:
-        if col in hist.columns:
-            columnas.append(col)
-
-    columnas = list(dict.fromkeys(columnas))
-    hist_view = hist[columnas].copy()
-
-    if hist_view.columns.duplicated().any():
-        from pandas.io.parsers import ParserBase
-        hist_view.columns = ParserBase({'names': hist_view.columns})._maybe_dedup_names(hist_view.columns)
-
-    fmt_nums = {
-        "volume": "{:.2f}",
-        "open_price": "{:.5f}",
-        "close_price": "{:.5f}",
-        "commission": "{:.2f}",
-        "swap": "{:.2f}",
-        "profit": "{:.2f}",
-        "pnl_real": "{:.2f}",
-        "equity_cum": "{:.2f}",
-    }
-
-    st.dataframe(
-        hist_view.style.format(fmt_nums),
-        use_container_width=True,
-        height=380
-    )
-
-    csv = hist_view.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="⬇️ Descargar historial completo (CSV)",
-        data=csv,
-        file_name=f"historial_{str(selected).replace(' ','_')}.csv",
-        mime="text/csv"
     )
