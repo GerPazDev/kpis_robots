@@ -99,6 +99,87 @@ def _ensure_fee_cols(df: pd.DataFrame) -> pd.DataFrame:
     df["real_profit"] = df["profit"] + df["commission"] + df["swap"]
     return df
 
+def _merge_deals_to_trades(df: pd.DataFrame) -> pd.DataFrame:
+    """Algoritmo FIFO para convertir historiales de 'Deals' (2 filas por trade) en Posiciones (1 fila)."""
+    if "profit" not in df.columns or len(df) < 2:
+        return df
+        
+    zeros = (df["profit"] == 0).sum()
+    if zeros < len(df) * 0.3:
+        # Si menos del 30% tiene profit 0, asumimos que ya son posiciones unificadas
+        return df
+
+    trades = []
+    group_col = "Magic" if "Magic" in df.columns and df["Magic"].notna().any() else "Comment"
+    open_deals = {}
+    
+    time_col = "close_time" if "close_time" in df.columns else "open_time"
+    if time_col not in df.columns:
+        return df
+        
+    df = df.sort_values(time_col)
+    
+    for idx, row in df.iterrows():
+        # Ignorar depósitos y balances
+        if "type" in df.columns and str(row["type"]).lower() in ["balance", "deposit", "withdrawal"]:
+            continue
+            
+        grp = row.get(group_col, "UNKNOWN")
+        sym = row.get("symbol", "UNKNOWN")
+        key = (grp, sym)
+        
+        if key not in open_deals:
+            open_deals[key] = []
+            
+        is_out = False
+        
+        # Un deal de salida (OUT) suele tener Profit o etiquetas de cierre en el Comment
+        if float(row.get("profit", 0) or 0) != 0:
+            is_out = True
+        elif isinstance(row.get("Comment"), str) and any(x in str(row["Comment"]).lower() for x in ["[tp", "[sl", "close"]):
+            is_out = True
+        elif "direction" in df.columns and str(row["direction"]).lower() == "out":
+            is_out = True
+            
+        # Si no lo detectamos pero ya hay un deal abierto del tipo opuesto, asumimos que es el cierre (FIFO)
+        if not is_out and len(open_deals[key]) > 0:
+            last_deal = open_deals[key][0]
+            if "type" in row and "type" in last_deal:
+                t1, t2 = str(last_deal["type"]).lower(), str(row["type"]).lower()
+                if (t1 == "buy" and t2 == "sell") or (t1 == "sell" and t2 == "buy"):
+                    is_out = True
+                    
+        if not is_out:
+            # Guardamos el deal de entrada
+            open_deals[key].append(row)
+        else:
+            if len(open_deals[key]) > 0:
+                in_deal = open_deals[key].pop(0)
+                
+                # Fusionamos ambos en una sola operación
+                trade = row.to_dict()
+                trade["open_time"] = in_deal.get(time_col, row.get(time_col))
+                trade["close_time"] = row.get(time_col)
+                trade["open_price"] = in_deal.get("open_price", row.get("open_price"))
+                trade["close_price"] = row.get("close_price", row.get("open_price"))
+                
+                # ¡Suma importante de comisiones de ambos deals!
+                trade["commission"] = float(in_deal.get("commission", 0) or 0) + float(row.get("commission", 0) or 0)
+                trade["swap"] = float(in_deal.get("swap", 0) or 0) + float(row.get("swap", 0) or 0)
+                trade["profit"] = float(row.get("profit", 0) or 0)
+                
+                trade["Comment"] = in_deal.get("Comment", row.get("Comment"))
+                trade["Magic"] = in_deal.get("Magic", row.get("Magic"))
+                
+                trades.append(trade)
+            else:
+                trades.append(row.to_dict())
+                
+    if not trades:
+        return df
+        
+    return pd.DataFrame(trades)
+
 # ========= Parsing MT5 (XLSX) =========
 def parse_mt5_xlsx(xlsx_bytes: bytes, time_tolerance="10min", vol_tol=1e-6) -> pd.DataFrame:
     xls = pd.ExcelFile(BytesIO(xlsx_bytes))
@@ -206,7 +287,6 @@ def parse_mt5_xlsx(xlsx_bytes: bytes, time_tolerance="10min", vol_tol=1e-6) -> p
 def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
     file_bytes = uploaded_csv.read()
     
-    # Intentamos decodificar en varios formatos comunes de exportación
     try:
         df_pos = pd.read_csv(BytesIO(file_bytes), sep=None, engine='python', encoding='utf-16')
     except UnicodeError:
@@ -215,11 +295,11 @@ def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
         except UnicodeError:
             df_pos = pd.read_csv(BytesIO(file_bytes), sep=None, engine='python', encoding='latin-1')
 
-    # Mapeo universal (soporta columnas de scripts custom)
     rename_try = {
         'Open Time':'open_time', 'Close Time':'close_time', 'Time':'close_time', 'Date':'close_time',
         'Symbol':'symbol', 'Item':'symbol',
         'Type':'type', 'Action':'type',
+        'Direction':'direction', 
         'Volume':'volume', 'Size':'volume',
         'Open Price':'open_price', 'Close Price':'close_price', 'Price':'close_price',
         'Commission':'commission', 'Swap':'swap', 'Profit':'profit',
@@ -227,7 +307,6 @@ def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
         'Ticket':'position', 'Order':'position'
     }
     
-    # Hacer el emparejamiento ignorando mayúsculas y minúsculas
     col_map = {}
     for col in df_pos.columns:
         col_lower = str(col).strip().lower()
@@ -238,16 +317,17 @@ def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
                 
     df_pos = df_pos.rename(columns=col_map)
     
-    # Parseo de fechas y números
     for c in ['open_time','close_time']:
         if c in df_pos.columns: df_pos[c] = pd.to_datetime(df_pos[c], errors='coerce')
     for c in ['volume','open_price','close_price','commission','swap','profit']:
         if c in df_pos.columns: df_pos[c] = pd.to_numeric(df_pos[c], errors='coerce')
         
-    # Validaciones de seguridad para scripts custom que les falten columnas clave
     if 'Comment' not in df_pos.columns: df_pos['Comment'] = np.nan
     if 'Magic' not in df_pos.columns: df_pos['Magic'] = np.nan
     if 'symbol' not in df_pos.columns: df_pos['symbol'] = "UNKNOWN"
+    
+    # NUEVO: Convertimos los Deals en Trades enteros antes de procesar los KPIs
+    df_pos = _merge_deals_to_trades(df_pos)
     
     return _ensure_fee_cols(df_pos)
 
@@ -315,13 +395,11 @@ def kpis_por_robot(df_pos: pd.DataFrame):
     df = df_pos.copy()
     df[key] = df[key].astype(str)
 
-    # Identificación segura de la columna de tiempo para evitar KeyErrors
     if "close_time" in df.columns and df["close_time"].notna().any():
         tcol = "close_time"
     elif "open_time" in df.columns and df["open_time"].notna().any():
         tcol = "open_time"
     else:
-        # Fallback de seguridad si no hay ninguna columna de tiempo válida
         tcol = "close_time"
         if "close_time" not in df.columns:
             df["close_time"] = pd.NaT
@@ -419,10 +497,9 @@ fusionar_archivos = st.sidebar.checkbox(
 )
 
 def clean_id(x):
-    """Limpia los IDs (especialmente Magics que Pandas lee como float ej: 123.0)"""
     if pd.isna(x) or str(x).strip() == "": return "UNKNOWN"
     sx = str(x).strip()
-    if sx.endswith(".0"): return sx[:-2] # Quita el .0
+    if sx.endswith(".0"): return sx[:-2]
     return sx
 
 all_dfs = []
@@ -445,7 +522,6 @@ for uploaded in uploaded_files:
             st.sidebar.warning(f"No hay operaciones válidas en {uploaded.name}.")
             continue
 
-        # Asignar el robot_id según la elección del usuario
         col_target = "Magic" if agrupar_por == "Magic Number" else "Comment"
         
         if col_target in df_temp.columns:
@@ -453,7 +529,6 @@ for uploaded in uploaded_files:
         else:
             df_temp["robot_id"] = "UNKNOWN"
             
-        # Para que los "UNKNOWN" al menos se diferencien por símbolo si no tienen Comment/Magic
         mask_unknown = df_temp["robot_id"] == "UNKNOWN"
         if mask_unknown.any():
             df_temp.loc[mask_unknown, "robot_id"] = df_temp.loc[mask_unknown, "symbol"].astype(str) + "_UNKNOWN"
@@ -599,7 +674,6 @@ if selected:
     otra_time = "open_time" if tcol == "close_time" else "close_time"
     if otra_time in hist.columns and otra_time != tcol: columnas.append(otra_time)
 
-    # Añadimos Comment y Magic a las columnas visibles de la tabla si existen
     for col in ["symbol", "type", "volume", "open_price", "close_price",
                 "commission", "swap", "profit", "pnl_real", "equity_cum",
                 "position", "robot_id", "Comment", "Magic", "source_file"]:
