@@ -318,6 +318,122 @@ def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
     
     return _ensure_fee_cols(df_pos)
 
+# ========= Parsing MT5 Deals CSV (Magic Number export) =========
+@st.cache_data(show_spinner=False)
+def parse_mt5_deals_csv(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Parser para el formato de exportación de Deals de MT5 con Magic Number.
+    Formato: CSV separado por ';', UTF-16, columnas:
+    Time;Deal;Symbol;Type;Direction;Volume;Price;Order;Commission;Fee;Swap;Profit;Balance;Magic;Comment
+    Cada trade tiene 2 filas: entrada (Profit=0) y salida (Profit≠0).
+    Se fusionan con FIFO por (Magic, Symbol).
+    """
+    # Intentar leer con distintos encodings
+    for enc in ["utf-16", "utf-8-sig", "utf-8", "latin-1"]:
+        try:
+            df_raw = pd.read_csv(BytesIO(file_bytes), sep=";", encoding=enc)
+            break
+        except Exception:
+            continue
+    else:
+        raise ValueError("No se pudo leer el archivo CSV de Deals. Verificá el encoding.")
+
+    # Filtrar filas de balance/depósito/retiro
+    if "Type" in df_raw.columns:
+        df_raw = df_raw[~df_raw["Type"].astype(str).str.lower().isin(
+            ["balance", "deposit", "withdrawal", "credit"]
+        )].copy()
+
+    # Parsear fechas
+    if "Time" in df_raw.columns:
+        df_raw["Time"] = pd.to_datetime(df_raw["Time"], errors="coerce")
+
+    # Convertir numéricos
+    for c in ["Volume", "Price", "Commission", "Fee", "Swap", "Profit", "Balance", "Magic", "Order"]:
+        if c in df_raw.columns:
+            df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
+
+    df_raw = df_raw.dropna(subset=["Time"]).sort_values("Time").reset_index(drop=True)
+
+    # ── FIFO merge: entrada (profit=0) + salida (profit≠0) ────
+    trades = []
+    open_deals: dict = {}
+
+    for _, row in df_raw.iterrows():
+        magic  = row.get("Magic", 0)
+        sym    = str(row.get("Symbol", "UNKNOWN"))
+        key    = (magic, sym)
+
+        if key not in open_deals:
+            open_deals[key] = []
+
+        profit_val = float(row.get("Profit", 0) or 0)
+        comment    = str(row.get("Comment", ""))
+        is_out     = (profit_val != 0) or comment.startswith("[")
+
+        if not is_out:
+            open_deals[key].append(row)
+        else:
+            if open_deals[key]:
+                entry = open_deals[key].pop(0)
+                comm_in  = float(entry.get("Commission", 0) or 0)
+                comm_out = float(row.get("Commission",  0) or 0)
+                swap_in  = float(entry.get("Swap", 0) or 0)
+                swap_out = float(row.get("Swap",  0) or 0)
+                trades.append({
+                    "open_time":   entry["Time"],
+                    "close_time":  row["Time"],
+                    "symbol":      sym,
+                    "type":        str(entry.get("Direction", "")),
+                    "volume":      float(entry.get("Volume", 0) or 0),
+                    "open_price":  float(entry.get("Price", 0) or 0),
+                    "close_price": float(row.get("Price", 0) or 0),
+                    "commission":  comm_in + comm_out,
+                    "swap":        swap_in + swap_out,
+                    "profit":      profit_val,
+                    "Magic":       magic,
+                    "Comment":     str(entry.get("Comment", "")),
+                    "position":    float(entry.get("Order", 0) or 0),
+                })
+            else:
+                # Salida sin entrada registrada — añadir de todas formas
+                trades.append({
+                    "open_time":   row["Time"],
+                    "close_time":  row["Time"],
+                    "symbol":      sym,
+                    "type":        str(row.get("Direction", "")),
+                    "volume":      float(row.get("Volume", 0) or 0),
+                    "open_price":  float(row.get("Price", 0) or 0),
+                    "close_price": float(row.get("Price", 0) or 0),
+                    "commission":  float(row.get("Commission", 0) or 0),
+                    "swap":        float(row.get("Swap", 0) or 0),
+                    "profit":      profit_val,
+                    "Magic":       magic,
+                    "Comment":     str(row.get("Comment", "")),
+                    "position":    float(row.get("Order", 0) or 0),
+                })
+
+    if not trades:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(trades)
+    df["Comment"] = df["Comment"].replace("nan", np.nan)
+    return _ensure_fee_cols(df)
+
+
+def _is_deals_csv(file_bytes: bytes) -> bool:
+    """Detecta si un CSV tiene el formato de Deals de MT5 (columna Magic + separador ';')."""
+    for enc in ["utf-16", "utf-8-sig", "utf-8", "latin-1"]:
+        try:
+            sample = file_bytes[:1000].decode(enc)
+            first_line = sample.splitlines()[0] if sample.splitlines() else ""
+            cols = [c.strip().lower() for c in first_line.split(";")]
+            return "magic" in cols and "deal" in cols and "direction" in cols
+        except Exception:
+            continue
+    return False
+
+
 # ========= Parsing MT4 (HTML) =========
 @st.cache_data(show_spinner=False)
 def parse_mt4_html(html_bytes: bytes) -> pd.DataFrame:
@@ -1340,12 +1456,32 @@ with st.spinner("⏳ Procesando archivos..."):
   for uploaded in uploaded_files:
     suffix = uploaded.name.lower().split(".")[-1]
     try:
+        file_bytes = uploaded.read()
+
         if suffix == "xlsx":
-            df_temp = parse_mt5_xlsx(uploaded.read())
+            df_temp = parse_mt5_xlsx(file_bytes)
         elif suffix == "csv":
-            df_temp = parse_csv(uploaded)
+            # Detectar si es el formato Deals de MT5 (Magic + separador ;)
+            if _is_deals_csv(file_bytes):
+                df_temp = parse_mt5_deals_csv(file_bytes)
+                # Para Deals CSV siempre agrupar por Magic Number automáticamente
+                if "Magic" in df_temp.columns:
+                    df_temp["robot_id"] = df_temp["Magic"].apply(clean_id)
+                    mask_unknown = df_temp["robot_id"] == "UNKNOWN"
+                    if mask_unknown.any():
+                        df_temp.loc[mask_unknown, "robot_id"] = (
+                            df_temp.loc[mask_unknown, "symbol"].astype(str) + "_UNKNOWN"
+                        )
+                    if not fusionar_archivos:
+                        df_temp["robot_id"] = df_temp["robot_id"].astype(str) + f" [{uploaded.name}]"
+                    df_temp["source_file"] = uploaded.name
+                    all_dfs.append(df_temp)
+                    st.sidebar.success(f"✅ Deals CSV detectado: {uploaded.name} — agrupado por Magic Number")
+                    continue  # skip the generic robot_id logic below
+            else:
+                df_temp = parse_csv(BytesIO(file_bytes))
         elif suffix in ("htm", "html"):
-            df_temp = parse_mt4_html(uploaded.read())
+            df_temp = parse_mt4_html(file_bytes)
         else:
             st.sidebar.error(f"Extensión no soportada: {uploaded.name}")
             continue
