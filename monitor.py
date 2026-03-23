@@ -997,12 +997,13 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
         baseline_manual = bc1.number_input(
             "Expectancy baseline (valor por trade en $)",
             min_value=-1000.0, max_value=10000.0, value=0.0, step=0.01,
-            format="%.3f",
+            format="%.2f",
+            key="baseline_manual_input",
             help="Ingresá la expectancy promedio por trade obtenida en tu backtesting o período de referencia anterior"
         )
         baseline_trades = 20  # valor por defecto, no se usará
         bc2.info(
-            f"📌 Usando baseline manual de **${baseline_manual:.3f}** por trade. "
+            f"📌 Usando baseline manual de **${baseline_manual:.2f}** por trade. "
             "Este valor reemplaza el cálculo automático desde los datos cargados."
         )
 
@@ -1026,11 +1027,11 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
             if baseline_manual is not None:
                 baseline_exp = float(baseline_manual)
                 baseline_n = 0
-                baseline_desc = f"Manual — ${baseline_exp:.3f} / trade"
+                baseline_desc = f"Manual — ${baseline_exp:.2f} / trade"
             else:
                 baseline_n = min(baseline_trades, n_trades)
                 baseline_exp = float(pnl.iloc[:baseline_n].mean())
-                baseline_desc = f"Automático ({baseline_n} trades) — ${baseline_exp:.3f} / trade"
+                baseline_desc = f"Automático ({baseline_n} trades) — ${baseline_exp:.2f} / trade"
 
             # ── Scores por período ─────────────────────────────────────────
             def get_last_blocks(size, max_blocks=3):
@@ -1533,11 +1534,62 @@ if not selected_symbols:
     st.warning("⚠️ Debes seleccionar al menos un símbolo en la barra lateral para ver resultados.")
     st.stop()
 
+st.sidebar.markdown("---")
+st.sidebar.header("🤖 Filtros de Robots")
+
+# ── Mínimo de trades ──────────────────────────────────────────
+min_trades_filter = st.sidebar.number_input(
+    "Mínimo de trades por robot",
+    min_value=1, max_value=500, value=1, step=1,
+    help="Robots con menos trades que este valor no se mostrarán."
+)
+
+# ── Activo desde fecha ────────────────────────────────────────
+tcol_full = "close_time" if ("close_time" in df_pos_full.columns and df_pos_full["close_time"].notna().any()) else "open_time"
+all_robot_dates = df_pos_full.groupby("robot_id")[tcol_full].max().dropna()
+
+# Fecha más antigua de última actividad para el slider
+global_min_activity = all_robot_dates.min().date() if not all_robot_dates.empty else None
+global_max_activity = all_robot_dates.max().date() if not all_robot_dates.empty else None
+
+if global_min_activity and global_max_activity and global_min_activity < global_max_activity:
+    last_activity_after = st.sidebar.date_input(
+        "Último trade después de",
+        value=global_min_activity,
+        min_value=global_min_activity,
+        max_value=global_max_activity,
+        help="Solo muestra robots que hayan operado después de esta fecha. Útil para ocultar robots inactivos."
+    )
+else:
+    last_activity_after = None
+
 df_pos = df_pos_full[df_pos_full["symbol"].isin(selected_symbols)].copy()
 
 if df_pos.empty:
     st.warning("No hay operaciones para los símbolos seleccionados.")
     st.stop()
+
+# ── Aplicar filtros de robots ─────────────────────────────────
+# Calcular trades por robot y última actividad
+robot_trade_counts  = df_pos.groupby("robot_id").size()
+robot_last_activity = df_pos.groupby("robot_id")[tcol_full].max() if tcol_full in df_pos.columns else None
+
+robots_to_keep = set(robot_trade_counts[robot_trade_counts >= min_trades_filter].index)
+
+if last_activity_after is not None and robot_last_activity is not None:
+    cutoff = pd.Timestamp(last_activity_after)
+    active_robots = set(robot_last_activity[robot_last_activity >= cutoff].index)
+    robots_to_keep = robots_to_keep & active_robots
+
+if robots_to_keep:
+    df_pos = df_pos[df_pos["robot_id"].isin(robots_to_keep)].copy()
+else:
+    st.warning("⚠️ Ningún robot cumple los filtros actuales. Ajustá los criterios.")
+    st.stop()
+
+n_filtered = len(df_pos_full["robot_id"].unique()) - len(robots_to_keep)
+if n_filtered > 0:
+    st.sidebar.caption(f"🔍 {n_filtered} robot(s) ocultados por los filtros aplicados.")
 
 # ==========================================
 # 📈 MAIN AREA: Tabs
