@@ -1,7 +1,4 @@
 # app.py
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -171,7 +168,6 @@ def _merge_deals_to_trades(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(trades)
 
 # ========= Parsing MT5 (XLSX) =========
-@st.cache_data(show_spinner=False)
 def parse_mt5_xlsx(xlsx_bytes: bytes, time_tolerance="10min", vol_tol=1e-6) -> pd.DataFrame:
     xls = pd.ExcelFile(BytesIO(xlsx_bytes))
     df_raw = pd.read_excel(xls, xls.sheet_names[0])
@@ -271,9 +267,8 @@ def parse_mt5_xlsx(xlsx_bytes: bytes, time_tolerance="10min", vol_tol=1e-6) -> p
     return _ensure_fee_cols(df_pos)
 
 # ========= Parsing MT5/Custom (CSV) =========
-@st.cache_data(show_spinner=False)
 def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
-    file_bytes = uploaded_csv.read() if hasattr(uploaded_csv, 'read') else uploaded_csv
+    file_bytes = uploaded_csv.read()
     
     try:
         df_pos = pd.read_csv(BytesIO(file_bytes), sep=None, engine='python', encoding='utf-16')
@@ -319,7 +314,6 @@ def parse_csv(uploaded_csv: BytesIO) -> pd.DataFrame:
     return _ensure_fee_cols(df_pos)
 
 # ========= Parsing MT4 (HTML) =========
-@st.cache_data(show_spinner=False)
 def parse_mt4_html(html_bytes: bytes) -> pd.DataFrame:
     soup = BeautifulSoup(html_bytes, "html.parser")
     rows = soup.find_all("tr", attrs={"align": "right"})
@@ -378,7 +372,6 @@ def parse_mt4_html(html_bytes: bytes) -> pd.DataFrame:
     return _ensure_fee_cols(df)
 
 # ========= KPIs =========
-@st.cache_data(show_spinner=False)
 def kpis_por_robot(df_pos: pd.DataFrame):
     key = "robot_id"
     df = df_pos.copy()
@@ -491,101 +484,28 @@ def compute_edge_score(expectancy_current: float, baseline: float) -> int:
 
 def edge_score_label(score: int) -> str:
     labels = {
-        3:  "🟢 Edge muy por encima del baseline",
-        2:  "🟢 Edge por encima del baseline",
-        1:  "🟢 Edge estable",
-        0:  "🟡 Edge levemente por debajo — monitorear",
-        -1: "🟠 Edge en decay moderado",
-        -2: "🔴 Edge en decay severo",
-        -3: "🔴 Edge negativo",
+        3:  "🟢 +3 Edge creciendo fuerte",
+        2:  "🟢 +2 Edge en crecimiento",
+        1:  "🟡 +1 Edge estable",
+        0:  "🟡  0  Alerta — monitorear",
+        -1: "🟠 -1 Decay moderado",
+        -2: "🔴 -2 Decay severo",
+        -3: "🔴 -3 Edge muerto / negativo",
     }
     return labels.get(score, "❓ Sin datos")
 
 
-def momentum_score(blocks: list[dict]) -> int | None:
-    """
-    Score de momentum basado en Δ% entre los últimos bloques consecutivos.
-    Independiente del baseline — mide la dirección actual del edge.
-    """
-    if len(blocks) < 2:
-        return None
-
-    # Usar hasta los últimos 3 bloques para calcular momentum
-    recent = blocks[-3:] if len(blocks) >= 3 else blocks
-    deltas = []
-    for i in range(1, len(recent)):
-        prev_e = recent[i-1]["expectancy"]
-        curr_e = recent[i]["expectancy"]
-        if prev_e != 0:
-            pct = ((curr_e - prev_e) / abs(prev_e)) * 100
-            deltas.append(pct)
-
-    if not deltas:
-        return None
-
-    avg_delta = sum(deltas) / len(deltas)
-
-    if avg_delta >= 15:
-        return 3
-    elif avg_delta >= 5:
-        return 2
-    elif avg_delta >= -5:
-        return 1
-    elif avg_delta >= -15:
-        return 0
-    elif avg_delta >= -30:
-        return -1
-    elif avg_delta >= -50:
-        return -2
-    else:
-        return -3
-
-
-def momentum_label(score: int | None) -> str:
-    if score is None:
-        return "❓ Sin datos suficientes"
-    labels = {
-        3:  "🟢 Acelerando fuerte",
-        2:  "🟢 Mejorando",
-        1:  "🟢 Estable",
-        0:  "🟡 Desacelerando levemente",
-        -1: "🟠 Decayendo",
-        -2: "🔴 Decayendo rápido",
-        -3: "🔴 Caída pronunciada",
+def edge_action(score: int) -> str:
+    actions = {
+        3:  "✅ Sizing normal o considerar aumentar",
+        2:  "✅ Sizing normal",
+        1:  "✅ Sizing normal — seguimiento semanal",
+        0:  "⚠️ Reducir sizing 25% — monitoreo diario",
+        -1: "⚠️ Reducir sizing 50%",
+        -2: "🛑 Pausar sistema — revisar parámetros",
+        -3: "🛑 Apagar sistema — rediseño necesario",
     }
-    return labels.get(score, "❓")
-
-
-def confluence_signal(vs_baseline: int | None, mom: int | None) -> tuple[str, str]:
-    """
-    Combina score vs baseline y momentum en una señal de confluencia.
-    Retorna (emoji + texto, color css).
-    """
-    if vs_baseline is None or mom is None:
-        return "❓ Datos insuficientes", "#888"
-
-    both_positive = vs_baseline >= 1 and mom >= 1
-    both_strong_positive = vs_baseline >= 2 and mom >= 2
-    both_negative = vs_baseline <= -1 and mom <= -1
-    both_strong_negative = vs_baseline <= -2 and mom <= -2
-    diverging = (vs_baseline >= 1 and mom <= -1) or (vs_baseline <= -1 and mom >= 1)
-
-    if both_strong_positive:
-        return "🌟 Excelente — edge sólido y en crecimiento", "#00d4aa"
-    elif both_positive:
-        return "✅ Positivo — edge sobre baseline y mejorando", "#00d4aa"
-    elif both_strong_negative:
-        return "🚨 Atención — decay confirmado en ambas métricas", "#ff4d6d"
-    elif both_negative:
-        return "⚠️ Precaución — señales de debilitamiento", "#f0a040"
-    elif diverging:
-        return "🔍 Investigar — señales contradictorias", "#f0c040"
-    elif vs_baseline >= 1:
-        return "🟡 Sobre baseline, momentum neutral", "#f0c040"
-    elif mom >= 1:
-        return "🟡 Mejorando, aún bajo baseline", "#f0c040"
-    else:
-        return "🟡 Neutral — monitorear evolución", "#f0c040"
+    return actions.get(score, "—")
 
 
 def compute_rolling_expectancy(pnl: pd.Series, window: int) -> pd.Series:
@@ -659,133 +579,6 @@ def edge_trend_arrow(scores: list[int]) -> str:
         return "📉 Decaimiento acelerado"
 
 
-def render_edge_comparison_table(
-    df_pos: pd.DataFrame,
-    tcol: str,
-    robots: list,
-    cp_size: int,
-    mp_size: int,
-    lp_size: int,
-    baseline_trades: int,
-    baseline_manual: float | None,
-):
-    """Tabla comparativa de edge para todos los robots. Reutilizable en múltiples tabs."""
-
-    # Nombres de columnas para scores numéricos (usados internamente para ordenar)
-    col_b_cp  = f"B·CP ({cp_size})"
-    col_b_mp  = f"B·MP ({mp_size})"
-    col_b_lp  = f"B·LP ({lp_size})"
-    col_m_cp  = f"M·CP ({cp_size})"
-    col_m_mp  = f"M·MP ({mp_size})"
-    col_m_lp  = f"M·LP ({lp_size})"
-    score_cols = [col_b_cp, col_b_mp, col_b_lp, col_m_cp, col_m_mp, col_m_lp]
-
-    summary_rows = []
-    for rid in robots:
-        g = df_pos[df_pos["robot_id"].astype(str) == rid].copy()
-        g = g.sort_values(tcol) if tcol in g.columns else g
-        pnl = g["real_profit"].fillna(0.0).reset_index(drop=True)
-        n = len(pnl)
-
-        if n < cp_size:
-            continue
-
-        if baseline_manual is not None:
-            b_exp = float(baseline_manual)
-        else:
-            b_n = min(baseline_trades, n)
-            b_exp = float(pnl.iloc[:b_n].mean())
-
-        def last_score(size):
-            blocks = compute_period_blocks(pnl, size)
-            if not blocks:
-                return None, []
-            return compute_edge_score(blocks[-1]["expectancy"], b_exp), blocks
-
-        cp_s, cp_bl = last_score(cp_size)
-        mp_s, mp_bl = last_score(mp_size)
-        lp_s, lp_bl = last_score(lp_size)
-
-        cp_m = momentum_score(cp_bl)
-        mp_m = momentum_score(mp_bl)
-        lp_m = momentum_score(lp_bl)
-
-        ref_b = lp_s if lp_s is not None else (mp_s if mp_s is not None else cp_s)
-        ref_m = lp_m if lp_m is not None else (mp_m if mp_m is not None else cp_m)
-        conf_text, _ = confluence_signal(ref_b, ref_m)
-        conf_short = conf_text.split("—")[-1].strip() if "—" in conf_text else conf_text.split(" ", 1)[-1]
-
-        # Guardar valores numéricos reales para ordenamiento correcto
-        # None → pd.NA para que Streamlit los trate como faltantes al ordenar
-        def nv(s): return s if s is not None else pd.NA
-
-        summary_rows.append({
-            "Robot":       rid,
-            "Trades":      n,
-            col_b_cp:      nv(cp_s),
-            col_b_mp:      nv(mp_s),
-            col_b_lp:      nv(lp_s),
-            col_m_cp:      nv(cp_m),
-            col_m_mp:      nv(mp_m),
-            col_m_lp:      nv(lp_m),
-            "Confluencia": conf_short,
-            "Exp.Base":    round(b_exp, 3),
-        })
-
-    if not summary_rows:
-        st.info(f"Se necesitan al menos {cp_size} trades por robot para la tabla de edge.")
-        return
-
-    df_summary = pd.DataFrame(summary_rows)
-
-    # Asegurar que columnas de score sean Int64 nullable (soporta pd.NA y ordena correctamente)
-    for c in score_cols:
-        if c in df_summary.columns:
-            df_summary[c] = pd.array(df_summary[c], dtype="Int64")
-
-    def color_score_cell(val):
-        try:
-            v = int(val)
-            if v >= 2:  return "color: #00d4aa; font-weight: bold"
-            if v == 1:  return "color: #00d4aa"
-            if v == 0:  return "color: #f0c040"
-            if v == -1: return "color: #f0a040"
-            return "color: #ff4d6d; font-weight: bold"
-        except:
-            return "color: #888"
-
-    def color_confluence(val):
-        v = str(val).lower()
-        if any(k in v for k in ["excelente", "positivo", "sólido"]):
-            return "color: #00d4aa; font-weight: bold"
-        if any(k in v for k in ["atención", "decay", "precaución"]):
-            return "color: #ff4d6d; font-weight: bold"
-        if any(k in v for k in ["investigar", "contradictorias", "neutral", "monitorear"]):
-            return "color: #f0c040"
-        return ""
-
-    present_score_cols = [c for c in score_cols if c in df_summary.columns]
-
-    def fmt_score(val):
-        try:
-            v = int(val)
-            return f"+{v}" if v > 0 else str(v)
-        except:
-            return "—"
-
-    fmt_map = {c: fmt_score for c in present_score_cols}
-
-    st.dataframe(
-        df_summary.style
-            .map(color_score_cell, subset=present_score_cols)
-            .map(color_confluence, subset=["Confluencia"])
-            .format(fmt_map, na_rep="—"),
-        use_container_width=True,
-        hide_index=True,
-        column_order=["Robot", "Trades"] + present_score_cols + ["Confluencia", "Exp.Base"],
-    )
-
-
 def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
     """Renderiza la pestaña completa de Edge Analytics."""
 
@@ -828,93 +621,36 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
         st.warning("No hay robots disponibles.")
         return
 
-    # ── Selector de robot ──────────────────────────────────────────────────
-    st.markdown("#### 🤖 Seleccionar Robot")
-
-    # Construir opciones con info rápida de trades
-    robot_options = {}
-    for rid in robots:
-        g_tmp = df_pos[df_pos["robot_id"].astype(str) == rid]
-        n_tmp = len(g_tmp)
-        robot_options[f"🤖 {rid}  ({n_tmp} trades)"] = rid
-
-    selected_robot_label = st.selectbox(
-        "Robot a analizar:",
-        options=list(robot_options.keys()),
-        help="Seleccioná el robot que querés analizar en detalle."
-    )
-    selected_rid = robot_options[selected_robot_label]
-
-    st.markdown("---")
-
     # ── Configuración de períodos ──────────────────────────────────────────
     st.markdown("#### ⚙️ Configuración de períodos")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     cp_size = c1.number_input("Corto Plazo (trades)", min_value=5, max_value=50, value=10, step=5,
                                help="Número de trades por bloque de corto plazo")
     mp_size = c2.number_input("Medio Plazo (trades)", min_value=10, max_value=100, value=20, step=5,
                                help="Número de trades por bloque de medio plazo")
     lp_size = c3.number_input("Largo Plazo (trades)", min_value=20, max_value=200, value=50, step=10,
                                help="Número de trades por bloque de largo plazo")
-
-    # ── Configuración de Baseline ──────────────────────────────────────────
-    st.markdown("#### 📐 Baseline de Expectancy")
-    st.caption("El baseline es la expectancy de referencia contra la que se mide el edge actual.")
-
-    baseline_mode = st.radio(
-        "Fuente del baseline:",
-        options=["📊 Automático (promedio de los primeros N trades)", "✏️ Manual (ingreso desde backtesting u otra fuente)"],
-        horizontal=True,
-        help="Automático calcula el baseline desde los datos cargados. Manual permite ingresar un valor conocido."
-    )
-
-    if baseline_mode.startswith("📊"):
-        bc1, bc2 = st.columns([1, 3])
-        baseline_trades = bc1.number_input(
-            "Primeros N trades para baseline",
-            min_value=10, max_value=200, value=20, step=10,
-            help="Se usarán los primeros N trades del historial para calcular el baseline"
-        )
-        baseline_manual = None
-    else:
-        bc1, bc2 = st.columns([1, 3])
-        baseline_manual = bc1.number_input(
-            "Expectancy baseline (valor por trade en $)",
-            min_value=-1000.0, max_value=10000.0, value=0.0, step=0.01,
-            format="%.3f",
-            help="Ingresá la expectancy promedio por trade obtenida en tu backtesting o período de referencia anterior"
-        )
-        baseline_trades = 20  # valor por defecto, no se usará
-        bc2.info(
-            f"📌 Usando baseline manual de **${baseline_manual:.3f}** por trade. "
-            "Este valor reemplaza el cálculo automático desde los datos cargados."
-        )
+    baseline_trades = c4.number_input("Baseline (primeros N trades)", min_value=10, max_value=200, value=50, step=10,
+                                       help="Primeros N trades para calcular expectancy baseline del sistema")
 
     st.markdown("---")
 
-    # ── Panel del robot seleccionado ──────────────────────────────────────
-    rid = selected_rid
-    if True:  # bloque único reemplaza el for loop
+    # ── Panel por robot ────────────────────────────────────────────────────
+    for rid in robots:
         g = df_pos[df_pos["robot_id"].astype(str) == rid].copy()
         g = g.sort_values(tcol) if tcol in g.columns else g
         pnl = g["real_profit"].fillna(0.0).reset_index(drop=True)
         n_trades = len(pnl)
 
-        st.markdown(f"### 🤖 {rid} — {n_trades} trades totales")
+        with st.expander(f"🤖 {rid}  —  {n_trades} trades totales", expanded=(len(robots) == 1)):
 
-        if n_trades < cp_size:
-            st.info(f"⚠️ Mínimo {cp_size} trades necesarios para análisis de edge. Trades actuales: {n_trades}")
-        else:
+            if n_trades < cp_size:
+                st.info(f"⚠️ Mínimo {cp_size} trades necesarios para análisis de edge. Trades actuales: {n_trades}")
+                continue
 
-            # Baseline: automático o manual
-            if baseline_manual is not None:
-                baseline_exp = float(baseline_manual)
-                baseline_n = 0
-                baseline_desc = f"Manual — ${baseline_exp:.3f} / trade"
-            else:
-                baseline_n = min(baseline_trades, n_trades)
-                baseline_exp = float(pnl.iloc[:baseline_n].mean())
-                baseline_desc = f"Automático ({baseline_n} trades) — ${baseline_exp:.3f} / trade"
+            # Baseline
+            baseline_n = min(baseline_trades, n_trades)
+            baseline_exp = float(pnl.iloc[:baseline_n].mean())
 
             # ── Scores por período ─────────────────────────────────────────
             def get_last_blocks(size, max_blocks=3):
@@ -937,71 +673,48 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
             mp_now = mp_scores[-1] if mp_scores else None
             lp_now = lp_scores[-1] if lp_scores else None
 
-            # Momentum scores
-            cp_mom = momentum_score(cp_blocks)
-            mp_mom = momentum_score(mp_blocks)
-            lp_mom = momentum_score(lp_blocks)
+            # ── Fila de scores actuales ────────────────────────────────────
+            st.markdown("##### 📊 Score actual por horizonte")
+            col_cp, col_mp, col_lp, col_action = st.columns([1, 1, 1, 2])
 
-            # Confluencia (usar LP si disponible, sino MP, sino CP)
-            ref_baseline = lp_now if lp_now is not None else (mp_now if mp_now is not None else cp_now)
-            ref_mom = lp_mom if lp_mom is not None else (mp_mom if mp_mom is not None else cp_mom)
-            conf_text, conf_color = confluence_signal(ref_baseline, ref_mom)
+            def score_color_class(s):
+                if s is None: return "score-neu"
+                if s >= 1: return "score-pos"
+                if s <= -1: return "score-neg"
+                return "score-neu"
 
-            # ── Señal de confluencia destacada ────────────────────────────
-            st.markdown(
-                f"<div style='background:{conf_color}22; border-left: 4px solid {conf_color}; "
-                f"padding: 12px 16px; border-radius: 8px; margin-bottom: 16px;'>"
-                f"<span style='font-size:1.05rem; font-weight:600; color:{conf_color};'>{conf_text}</span>"
-                f"<span style='color:#888; font-size:0.8rem; margin-left:12px;'>Señal de confluencia</span>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
+            def render_score_col(col, label, score, blocks, period_size):
+                with col:
+                    st.markdown(f"<div class='period-label'>{label}</div>", unsafe_allow_html=True)
+                    if score is not None:
+                        css = score_color_class(score)
+                        sign = "+" if score > 0 else ""
+                        st.markdown(f"<div class='score-badge {css}'>{sign}{score}</div>", unsafe_allow_html=True)
+                        st.caption(edge_score_label(score).split(" ", 1)[-1])
+                        st.caption(f"Últ. bloque: {period_size} trades")
+                    else:
+                        st.markdown("<div class='score-badge score-neu'>—</div>", unsafe_allow_html=True)
+                        st.caption(f"Mínimo {period_size} trades")
 
-            # ── Tabla de scores por horizonte ──────────────────────────────
-            st.markdown("##### 📊 Score por horizonte")
+            render_score_col(col_cp, f"CORTO PLAZO ({cp_size})", cp_now, cp_blocks, cp_size)
+            render_score_col(col_mp, f"MEDIO PLAZO ({mp_size})", mp_now, mp_blocks, mp_size)
+            render_score_col(col_lp, f"LARGO PLAZO ({lp_size})", lp_now, lp_blocks, lp_size)
 
-            def fmt_score(s):
-                if s is None: return "—"
-                sign = "+" if s > 0 else ""
-                return f"{sign}{s}"
+            with col_action:
+                st.markdown("<div class='period-label'>ACCIÓN RECOMENDADA</div>", unsafe_allow_html=True)
+                # Acción basada en el LP si existe, sino MP, sino CP
+                action_score = lp_now if lp_now is not None else (mp_now if mp_now is not None else cp_now)
+                if action_score is not None:
+                    st.markdown(f"**{edge_action(action_score)}**")
 
-            score_data = {
-                "Horizonte": [f"Corto ({cp_size})", f"Medio ({mp_size})", f"Largo ({lp_size})"],
-                "vs Baseline": [fmt_score(cp_now), fmt_score(mp_now), fmt_score(lp_now)],
-                "Estado Baseline": [
-                    edge_score_label(cp_now).split(" ", 1)[-1] if cp_now is not None else "—",
-                    edge_score_label(mp_now).split(" ", 1)[-1] if mp_now is not None else "—",
-                    edge_score_label(lp_now).split(" ", 1)[-1] if lp_now is not None else "—",
-                ],
-                "Momentum": [fmt_score(cp_mom), fmt_score(mp_mom), fmt_score(lp_mom)],
-                "Estado Momentum": [
-                    momentum_label(cp_mom).split(" ", 1)[-1] if cp_mom is not None else "—",
-                    momentum_label(mp_mom).split(" ", 1)[-1] if mp_mom is not None else "—",
-                    momentum_label(lp_mom).split(" ", 1)[-1] if lp_mom is not None else "—",
-                ],
-            }
+                    # Tendencia global
+                    all_lp = lp_scores if lp_scores else mp_scores if mp_scores else cp_scores
+                    trend = edge_trend_arrow(all_lp)
+                    st.markdown(f"Tendencia LP: **{trend}**")
 
-            df_scores = pd.DataFrame(score_data)
+                    # Baseline info
+                    st.caption(f"Baseline ({baseline_n} trades): {baseline_exp:.2f} / trade")
 
-            def color_score_cell(val):
-                try:
-                    v = int(str(val).replace("+", ""))
-                    if v >= 2: return "color: #00d4aa; font-weight: bold"
-                    if v == 1: return "color: #00d4aa"
-                    if v == 0: return "color: #f0c040"
-                    if v == -1: return "color: #f0a040"
-                    return "color: #ff4d6d; font-weight: bold"
-                except:
-                    return "color: #888"
-
-            st.dataframe(
-                df_scores.style
-                    .map(color_score_cell, subset=["vs Baseline", "Momentum"]),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.caption(f"Baseline: {baseline_desc}")
             st.markdown("---")
 
             # ── Tabla de bloques históricos ────────────────────────────────
@@ -1108,9 +821,9 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
 
                     st.dataframe(
                         df_blocks.style
-                            .map(color_score, subset=["Score"])
-                            .map(color_delta_pct, subset=["Δ% Exp"])
-                            .map(color_vs_baseline, subset=["vs Baseline"]),
+                            .applymap(color_score, subset=["Score"])
+                            .applymap(color_delta_pct, subset=["Δ% Exp"])
+                            .applymap(color_vs_baseline, subset=["vs Baseline"]),
                         use_container_width=True,
                         hide_index=True,
                     )
@@ -1164,39 +877,25 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
             else:
                 st.info(f"Se necesitan al menos {roll_window} trades para el gráfico rolling.")
 
-            # ── Resumen de alertas ─────────────────────────────────────────
-            st.markdown("##### 🔔 Estado del sistema")
-            good_signals = []
-            watch_signals = []
-            alert_signals = []
+            # ── Resumen de alerta ──────────────────────────────────────────
+            st.markdown("##### 🚨 Resumen de alertas")
+            alerts = []
+            critical_alerts = []
 
-            # Señales positivas
-            if lp_now is not None and lp_now >= 2:
-                good_signals.append(f"🌟 **Largo plazo sobre baseline** (score {fmt_score(lp_now)}): el sistema está rindiendo por encima de su referencia histórica")
-            if lp_mom is not None and lp_mom >= 2:
-                good_signals.append(f"📈 **Momentum positivo en LP**: la expectancy viene mejorando en los últimos bloques")
-            if ref_baseline is not None and ref_baseline >= 2 and ref_mom is not None and ref_mom >= 2:
-                good_signals.append("🌟 **Confluencia positiva**: edge sobre baseline y con momentum al alza — sistema en buen estado")
-
-            # Señales de monitoreo
-            if cp_now is not None and cp_now <= -1 and (mp_now is None or mp_now >= 0):
-                watch_signals.append(f"🔍 **Corto plazo bajo baseline** (score {fmt_score(cp_now)}): puede ser ruido — observar evolución en próximos bloques")
-            if mp_mom is not None and mp_mom <= -1 and (lp_mom is None or lp_mom >= 0):
-                watch_signals.append("🔍 **Momentum de medio plazo desacelerando**: la tendencia reciente es descendente")
-            if len(mp_scores) >= 3 and all(mp_scores[-3+i] > mp_scores[-3+i+1] for i in range(2)):
-                watch_signals.append("📉 **3 bloques MP consecutivos en descenso** — prestar atención a la evolución")
-
-            # Alertas
+            if cp_now is not None and cp_now <= -1:
+                alerts.append(f"⚠️ **Corto plazo en decay** (score {cp_now}): revisar últimas {cp_size} operaciones")
             if mp_now is not None and mp_now <= -2:
-                alert_signals.append(f"⚠️ **Medio plazo en decay severo** (score {fmt_score(mp_now)}): la expectancy está significativamente bajo el baseline")
+                critical_alerts.append(f"🛑 **Medio plazo en decay severo** (score {mp_now}): considerar pausar sistema")
             if lp_now is not None and lp_now <= -2:
-                alert_signals.append(f"🚨 **Largo plazo en decay severo** (score {fmt_score(lp_now)}): el sistema muestra debilitamiento estructural del edge")
-            if len(lp_scores) >= 3 and all(lp_scores[-3+i] > lp_scores[-3+i+1] for i in range(2)):
-                alert_signals.append("🚨 **3 bloques LP consecutivos en descenso** — patrón de decay estructural")
-            if ref_baseline is not None and ref_baseline <= -1 and ref_mom is not None and ref_mom <= -1:
-                alert_signals.append("🚨 **Confluencia negativa**: edge bajo baseline y con momentum descendente — revisar el sistema")
+                critical_alerts.append(f"🛑 **Largo plazo en decay severo** (score {lp_now}): apagar y rediseñar")
 
-            # Decay rápido
+            # Tendencia bajista en 3 períodos consecutivos
+            if len(lp_scores) >= 3 and all(lp_scores[-3+i] > lp_scores[-3+i+1] for i in range(2)):
+                critical_alerts.append("📉 **3 bloques LP consecutivos en baja** — decay estructural confirmado")
+            elif len(mp_scores) >= 3 and all(mp_scores[-3+i] > mp_scores[-3+i+1] for i in range(2)):
+                alerts.append("📉 **3 bloques MP consecutivos en baja** — monitoreo urgente")
+
+            # Decay rápido: detectar caída ≥ 20% entre bloques consecutivos en MP y LP
             RAPID_DECAY_THRESHOLD = -20.0
 
             def check_rapid_decay(blocks, period_name):
@@ -1208,93 +907,122 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
                         pct = ((curr_e - prev_e) / abs(prev_e)) * 100
                         if pct <= RAPID_DECAY_THRESHOLD:
                             rapid.append(
-                                f"⚡ **Caída brusca en {period_name} bloque #{blocks[i]['bloque']}**: "
-                                f"expectancy cayó **{pct:.1f}%** en un solo bloque "
+                                f"⚡ **Decay rápido en {period_name} bloque #{blocks[i]['bloque']}**: "
+                                f"expectancy cayó **{pct:.1f}%** en un bloque "
                                 f"({prev_e:.3f} → {curr_e:.3f})"
                             )
                 return rapid
 
-            for r in check_rapid_decay(mp_blocks, "MP"):
-                alert_signals.append(r)
-            for r in check_rapid_decay(lp_blocks, "LP"):
-                alert_signals.append(r)
+            rapid_mp = check_rapid_decay(mp_blocks, "MP")
+            rapid_lp = check_rapid_decay(lp_blocks, "LP")
 
-            # Render
-            if good_signals:
-                for s in good_signals:
-                    st.success(s)
-            if watch_signals:
-                for s in watch_signals:
-                    st.warning(s)
-            if alert_signals:
-                for s in alert_signals:
-                    st.error(s)
-            if not good_signals and not watch_signals and not alert_signals:
-                st.info("ℹ️ Sistema dentro de parámetros normales — sin señales destacadas")
+            for r in rapid_mp:
+                critical_alerts.append(r)
+            for r in rapid_lp:
+                critical_alerts.append(r)
+
+            # Mostrar alertas: críticas primero en rojo, warnings en amarillo
+            if critical_alerts:
+                for a in critical_alerts:
+                    st.error(a)
+            if alerts:
+                for a in alerts:
+                    st.warning(a)
+            if not alerts and not critical_alerts:
+                st.success("✅ Sin alertas activas — sistema operando dentro de parámetros normales")
 
     # ── Tabla comparativa global ───────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### 🏆 Comparativa de Edge — Todos los Robots")
-    render_edge_comparison_table(
-        df_pos, tcol, robots,
-        cp_size, mp_size, lp_size,
-        baseline_trades, baseline_manual,
-    )
+
+    summary_rows = []
+    for rid in robots:
+        g = df_pos[df_pos["robot_id"].astype(str) == rid].copy()
+        g = g.sort_values(tcol) if tcol in g.columns else g
+        pnl = g["real_profit"].fillna(0.0).reset_index(drop=True)
+        n = len(pnl)
+
+        if n < cp_size:
+            continue
+
+        baseline_n = min(baseline_trades, n)
+        baseline_exp = float(pnl.iloc[:baseline_n].mean())
+
+        def last_score(size):
+            blocks = compute_period_blocks(pnl, size)
+            if not blocks:
+                return None
+            return compute_edge_score(blocks[-1]["expectancy"], baseline_exp)
+
+        cp_s = last_score(cp_size)
+        mp_s = last_score(mp_size)
+        lp_s = last_score(lp_size)
+
+        lp_blocks = compute_period_blocks(pnl, lp_size)
+        lp_scores_list = [compute_edge_score(b["expectancy"], baseline_exp) for b in lp_blocks]
+        trend = edge_trend_arrow(lp_scores_list) if lp_scores_list else "—"
+
+        action_score = lp_s if lp_s is not None else (mp_s if mp_s is not None else cp_s)
+
+        summary_rows.append({
+            "Robot": rid,
+            "Trades": n,
+            f"CP ({cp_size})": f"{'+' if cp_s and cp_s > 0 else ''}{cp_s}" if cp_s is not None else "—",
+            f"MP ({mp_size})": f"{'+' if mp_s and mp_s > 0 else ''}{mp_s}" if mp_s is not None else "—",
+            f"LP ({lp_size})": f"{'+' if lp_s and lp_s > 0 else ''}{lp_s}" if lp_s is not None else "—",
+            "Tendencia": trend,
+            "Acción": edge_action(action_score) if action_score is not None else "—",
+            "Baseline exp": round(baseline_exp, 3),
+        })
+
+    if summary_rows:
+        df_summary = pd.DataFrame(summary_rows)
+        st.dataframe(df_summary, use_container_width=True, hide_index=True)
+    else:
+        st.info(f"Se necesitan al menos {cp_size} trades por robot para la tabla comparativa.")
 
     # ── Leyenda ───────────────────────────────────────────────────────────
     with st.expander("📖 Leyenda de scores y metodología"):
         st.markdown("""
-        ### Sistema de scoring dual
+        ### Cómo se calcula el score (-3 a +3)
 
-        Cada robot se evalúa con **dos métricas independientes** que responden preguntas distintas:
-
-        #### Score vs Baseline
-        Compara la expectancy actual contra el baseline de referencia (backtest SQX o automático).
-        Responde: *¿El sistema está rindiendo como se esperaba históricamente?*
+        El score compara la **expectancy actual** de cada bloque contra el **baseline histórico** del sistema
+        (calculado con los primeros N trades, configurables arriba).
 
         | Score | Condición | Significado |
         |-------|-----------|-------------|
-        | **+3** | Expectancy ≥ 130% del baseline | Edge muy por encima del baseline |
-        | **+2** | Expectancy ≥ 110% del baseline | Edge por encima del baseline |
-        | **+1** | Expectancy 90–110% del baseline | Edge estable |
-        | **0**  | Expectancy 70–90% del baseline | Levemente por debajo — monitorear |
-        | **-1** | Expectancy 50–70% del baseline | Decay moderado |
+        | **+3** | Expectancy ≥ 130% del baseline | Edge creciendo fuerte |
+        | **+2** | Expectancy ≥ 110% del baseline | Edge en crecimiento |
+        | **+1** | Expectancy entre 90–110% del baseline | Edge estable |
+        | **0**  | Expectancy entre 70–90% del baseline | Alerta — monitorear |
+        | **-1** | Expectancy entre 50–70% del baseline | Decay moderado |
         | **-2** | Expectancy < 50% del baseline | Decay severo |
-        | **-3** | Expectancy negativa | Edge negativo |
+        | **-3** | Expectancy negativa | Edge muerto |
 
-        #### Score Momentum
-        Mide la dirección actual del edge comparando bloques consecutivos entre sí.
-        Responde: *¿El edge está mejorando o empeorando ahora mismo?*
+        ### Columnas de la tabla de bloques
 
-        | Score | Δ% promedio entre bloques | Significado |
-        |-------|--------------------------|-------------|
-        | **+3** | ≥ +15% | Acelerando fuerte |
-        | **+2** | +5% a +15% | Mejorando |
-        | **+1** | ±5% | Estable |
-        | **0**  | -5% a -15% | Desacelerando |
-        | **-1** | -15% a -30% | Decayendo |
-        | **-2** | -30% a -50% | Decayendo rápido |
-        | **-3** | < -50% | Caída pronunciada |
-
-        #### Señal de Confluencia
-        Combina ambos scores en una señal única. Las señales más confiables son cuando ambas métricas apuntan en la misma dirección.
-
-        | Confluencia | Significado |
-        |-------------|-------------|
-        | 🌟 Excelente | Ambos positivos y fuertes |
-        | ✅ Positivo | Ambos positivos |
-        | ⚠️ Precaución | Ambos negativos |
-        | 🚨 Atención | Ambos negativos y fuertes |
-        | 🔍 Investigar | Señales contradictorias |
-
-        #### Columnas de la tabla de bloques
         | Columna | Significado |
         |---------|-------------|
-        | **Expectancy** | Ganancia promedio por trade en ese bloque |
-        | **Δ% Exp** | Cambio porcentual vs bloque anterior. Rojo si cae ≥ 20% |
-        | **vs Baseline** | Diferencia % respecto al baseline del sistema |
-        | **Score** | Score vs baseline (-3 a +3) |
-        | **Δ Score** | Cambio en puntos respecto al bloque anterior |
+        | **Expectancy** | Ganancia/pérdida promedio por trade en ese bloque |
+        | **Δ% Exp** | Cambio porcentual de expectancy respecto al bloque anterior. 📈 verde = crecimiento, 📉 naranja = caída leve, 📉 **rojo** = decay rápido (≥ -20%) |
+        | **vs Baseline** | Cuánto está por encima o debajo del baseline histórico del sistema |
+        | **Score** | Score -3 a +3 basado en ratio vs baseline |
+        | **Δ Score** | Cambio en puntos del score respecto al bloque anterior |
+
+        ### Alertas de decay rápido
+        Se dispara cuando la expectancy cae **-20% o más en un solo bloque** — independientemente del score.
+        Un sistema puede pasar de score +2 a +1 (aparentemente estable) pero con una caída de -35% en expectancy.
+        Eso es decay rápido y requiere atención inmediata.
+
+        ### Reglas de acción
+        - **Decay rápido (Δ% ≤ -20%)**: alerta inmediata — investigar causa aunque el score aún sea positivo
+        - **3 bloques consecutivos bajando**: decay estructural confirmado → reducir sizing o pausar
+        - **LP en -2 o -3**: apagar sistema y revisar
+        - **CP baja pero LP estable**: posible ruido — no actuar aún, monitorear
+
+        ### Referencia teórica
+        Basado en el criterio de monitoreo de edge de **Edward Thorp** y el concepto de
+        **expectancy rolling** para detección temprana de edge decay.
         """)
 
 
@@ -1336,8 +1064,7 @@ def clean_id(x):
 
 all_dfs = []
 
-with st.spinner("⏳ Procesando archivos..."):
-  for uploaded in uploaded_files:
+for uploaded in uploaded_files:
     suffix = uploaded.name.lower().split(".")[-1]
     try:
         if suffix == "xlsx":
@@ -1428,16 +1155,6 @@ with tab_kpis:
             "Max DD": "{:.2f}",
         }),
         use_container_width=True
-    )
-
-    st.markdown("---")
-    st.markdown("#### 🎯 Edge — Comparativa rápida de todos los robots")
-    st.caption("Baseline automático (primeros 20 trades). Para ajustar parámetros o ingresar baseline manual, usá la pestaña **Edge Analytics**.")
-    robots_all = sorted(kpis_df["Robot ID"].astype(str).unique())
-    render_edge_comparison_table(
-        df_pos, tcol, robots_all,
-        cp_size=10, mp_size=20, lp_size=50,
-        baseline_trades=20, baseline_manual=None,
     )
 
 # ── Tab 2: Análisis por Robot ─────────────────────────────────────────────
