@@ -992,6 +992,28 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
             help="Se usarán los primeros N trades del historial para calcular el baseline"
         )
         baseline_manual = None
+
+        # Calcular y mostrar el baseline resultante para el robot seleccionado
+        _g_preview = df_pos[df_pos["robot_id"].astype(str) == selected_rid]
+        _pnl_preview = _g_preview["real_profit"].fillna(0.0).reset_index(drop=True)
+        _n_preview = len(_pnl_preview)
+        if _n_preview > 0:
+            _bn = min(baseline_trades, _n_preview)
+            _baseline_calc = float(_pnl_preview.iloc[:_bn].mean())
+            _color = "#00d4aa" if _baseline_calc > 0 else "#f87171"
+            bc2.markdown(
+                f"<div style='background:{_color}18;border:1px solid {_color};"
+                f"border-radius:6px;padding:8px 14px;margin-top:4px'>"
+                f"<span style='font-size:.75rem;color:#8b949e'>Baseline calculado "
+                f"(primeros {_bn} de {_n_preview} trades)</span><br>"
+                f"<span style='font-size:1.3rem;font-weight:900;color:{_color}'>"
+                f"${_baseline_calc:.2f}</span>"
+                f"<span style='font-size:.8rem;color:#8b949e'> / trade</span>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            bc2.info("Sin datos para calcular el baseline.")
     else:
         bc1, bc2 = st.columns([1, 3])
         baseline_manual = bc1.number_input(
