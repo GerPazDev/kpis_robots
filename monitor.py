@@ -12,6 +12,10 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="KPIs por Robot — MT4 & MT5", layout="wide")
 st.title("📊 KPIs por Robot 🦅 Aguila Trading (MT4 & MT5)")
 
+# ── Preservar pestaña activa entre reruns ──────────────────────────────────
+if "active_tab" not in st.session_state:
+    st.session_state.active_tab = 0
+
 # ========= Métricas =========
 def max_drawdown(equity: pd.Series) -> float:
     if equity.empty:
@@ -957,6 +961,7 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
     selected_robot_label = st.selectbox(
         "Robot a analizar:",
         options=list(robot_options.keys()),
+        key="edge_robot_selector",
         help="Seleccioná el robot que querés analizar en detalle."
     )
     selected_rid = robot_options[selected_robot_label]
@@ -967,10 +972,13 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
     st.markdown("#### ⚙️ Configuración de períodos")
     c1, c2, c3 = st.columns(3)
     cp_size = c1.number_input("Corto Plazo (trades)", min_value=5, max_value=50, value=10, step=5,
+                               key="edge_cp_size",
                                help="Número de trades por bloque de corto plazo")
     mp_size = c2.number_input("Medio Plazo (trades)", min_value=10, max_value=100, value=20, step=5,
+                               key="edge_mp_size",
                                help="Número de trades por bloque de medio plazo")
     lp_size = c3.number_input("Largo Plazo (trades)", min_value=20, max_value=200, value=50, step=10,
+                               key="edge_lp_size",
                                help="Número de trades por bloque de largo plazo")
 
     # ── Configuración de Baseline ──────────────────────────────────────────
@@ -981,6 +989,7 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
         "Fuente del baseline:",
         options=["📊 Automático (promedio de los primeros N trades)", "✏️ Manual (ingreso desde backtesting u otra fuente)"],
         horizontal=True,
+        key="edge_baseline_mode",
         help="Automático calcula el baseline desde los datos cargados. Manual permite ingresar un valor conocido."
     )
 
@@ -989,6 +998,7 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
         baseline_trades = bc1.number_input(
             "Primeros N trades para baseline",
             min_value=10, max_value=200, value=20, step=10,
+            key="edge_baseline_trades",
             help="Se usarán los primeros N trades del historial para calcular el baseline"
         )
         baseline_manual = None
@@ -1284,7 +1294,7 @@ def render_edge_tab(df_pos: pd.DataFrame, tcol: str):
                     "Ventana rolling (trades)",
                     min_value=5, max_value=min(100, n_trades),
                     value=min(mp_size, n_trades),
-                    key=f"roll_{rid}"
+                    key="edge_roll_window"
                 )
 
             roll_exp = compute_rolling_expectancy(pnl, roll_window).dropna()
@@ -1619,11 +1629,37 @@ if n_filtered > 0:
 
 kpis_df, key_used, tcol = kpis_por_robot(df_pos)
 
-tab_kpis, tab_robot, tab_edge = st.tabs([
-    "📊 KPIs Globales",
-    "🔎 Análisis por Robot",
-    "🎯 Edge Analytics",
-])
+# ── Preservar pestaña activa con query_params ─────────────────────────────
+_TAB_NAMES  = ["📊 KPIs Globales", "🔎 Análisis por Robot", "🎯 Edge Analytics"]
+_TAB_KEYS   = ["kpis", "robot", "edge"]
+
+# Leer pestaña activa desde query params
+_qp = st.query_params.get("tab", "kpis")
+_default_tab = _TAB_KEYS.index(_qp) if _qp in _TAB_KEYS else 0
+
+# JavaScript para detectar cambio de pestaña y guardar en query_params
+st.markdown("""
+<script>
+(function() {
+    function watchTabs() {
+        const tabs = document.querySelectorAll('[data-baseweb="tab"]');
+        tabs.forEach(function(tab, i) {
+            tab.addEventListener('click', function() {
+                const keys = ['kpis', 'robot', 'edge'];
+                const url = new URL(window.location.href);
+                url.searchParams.set('tab', keys[i] || 'kpis');
+                window.history.replaceState({}, '', url.toString());
+            });
+        });
+    }
+    setTimeout(watchTabs, 800);
+    const obs = new MutationObserver(function() { setTimeout(watchTabs, 300); });
+    obs.observe(document.body, { childList: true, subtree: true });
+})();
+</script>
+""", unsafe_allow_html=True)
+
+tab_kpis, tab_robot, tab_edge = st.tabs(_TAB_NAMES)
 
 # ── Tab 1: KPIs Globales ──────────────────────────────────────────────────
 with tab_kpis:
@@ -1654,7 +1690,7 @@ with tab_kpis:
 with tab_robot:
     st.subheader("🔎 Curva de equity por trade (PnL real)")
     robots = sorted(kpis_df['Robot ID'].astype(str).unique())
-    selected = st.selectbox("Seleccioná un robot para analizar a fondo:", robots)
+    selected = st.selectbox("Seleccioná un robot para analizar a fondo:", robots, key="tab2_robot_selector")
 
     if selected:
         g = df_pos.copy()
