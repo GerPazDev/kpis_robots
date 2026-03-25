@@ -24,10 +24,6 @@ def max_drawdown(equity: pd.Series) -> float:
     return float(dd.max())
 
 def current_drawdown_info(equity: pd.Series, account_balance: float | None = None) -> dict:
-    """
-    Calcula el drawdown en curso: distancia desde el último equity peak.
-    Si se provee account_balance, calcula el DD como % del balance de la cuenta.
-    """
     if equity.empty:
         return {
             "current_dd": 0.0, "dd_pct_account": 0.0 if account_balance else None,
@@ -405,7 +401,7 @@ def parse_mt4_html(html_bytes: bytes) -> pd.DataFrame:
 
 # ========= KPIs =========
 @st.cache_data(show_spinner=False)
-def kpis_por_robot(df_pos: pd.DataFrame, account_balance: float | None = None):
+def kpis_por_robot(df_pos: pd.DataFrame, account_balance: float | None = None, risk_per_trade: float | None = None):
     key = "robot_id"
     df = df_pos.copy()
     df[key] = df[key].astype(str)
@@ -423,18 +419,43 @@ def kpis_por_robot(df_pos: pd.DataFrame, account_balance: float | None = None):
         net_real = float(pnl_real.sum())
         ret_dd = float(net_real / mdd) if mdd > 0 else np.nan
         dd_info = current_drawdown_info(equity, account_balance)
+        
+        calmar = np.nan
+        if mdd > 0 and len(g) > 1 and pd.api.types.is_datetime64_any_dtype(g[tcol]):
+            days = (g[tcol].max() - g[tcol].min()).days
+            if days < 365.25:
+                calmar = net_real / mdd
+            elif days >= 1:
+                ann_ret = net_real / (days / 365.25)
+                calmar = ann_ret / mdd
+                
+        stability = stability_r2(equity)
+        exp_val = expectancy(pnl_real)
+        
         row_data = {
-            "Robot ID": rid, "Net profit (real)": net_real,
+            "Robot ID": rid, 
+            "Net profit (real)": net_real,
+            "Stability": stability,
+            "Calmar": calmar,
+            "Expectancy": exp_val,
+        }
+        
+        if risk_per_trade is not None and risk_per_trade > 0:
+            row_data["Exp (% R)"] = exp_val / risk_per_trade
+        
+        row_data.update({
             "# Trades": int((~pnl_real.isna()).sum()),
             "% Wins": float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0,
-            "PF": profit_factor(pnl_real), "Expectancy": expectancy(pnl_real),
-            "Ret/DD": ret_dd, "Max DD": mdd,
+            "PF": profit_factor(pnl_real),
+            "Ret/DD": ret_dd, 
+            "Max DD": mdd,
             "DD Actual": dd_info["current_dd"],
             "Trades s/Peak": dd_info["trades_since_peak"],
             "En Peak": dd_info["is_at_peak"],
             "Desde": g[tcol].min(), "Hasta": g[tcol].max(),
             "Símbolos": ", ".join(sorted(set(g["symbol"].dropna().astype(str)))) if "symbol" in g else "",
-        }
+            "Archivo": ", ".join(sorted(set(g["source_file"].dropna().astype(str)))) if "source_file" in g else "",
+        })
         if account_balance is not None and account_balance > 0:
             row_data["DD % Cuenta"] = dd_info["dd_pct_account"]
             row_data["Max DD % Cuenta"] = dd_info["max_dd_pct_account"]
@@ -442,7 +463,7 @@ def kpis_por_robot(df_pos: pd.DataFrame, account_balance: float | None = None):
     out = pd.DataFrame(rows).sort_values("Net profit (real)", ascending=False)
     return out, key, tcol
 
-def summary_kpis_robot(g: pd.DataFrame, tcol: str, account_balance: float | None = None) -> pd.DataFrame:
+def summary_kpis_robot(g: pd.DataFrame, tcol: str, account_balance: float | None = None, risk_per_trade: float | None = None) -> pd.DataFrame:
     pnl_real = g["real_profit"].fillna(0.0)
     equity = pnl_real.cumsum()
     wins, losses = int((pnl_real > 0).sum()), int((pnl_real < 0).sum())
@@ -451,6 +472,16 @@ def summary_kpis_robot(g: pd.DataFrame, tcol: str, account_balance: float | None
     net_real = float(pnl_real.sum())
     ret_dd = float(net_real / mdd) if mdd > 0 else np.nan
     dd_info = current_drawdown_info(equity, account_balance)
+    
+    calmar = np.nan
+    if mdd > 0 and len(g) > 1 and pd.api.types.is_datetime64_any_dtype(g[tcol]):
+        days = (g[tcol].max() - g[tcol].min()).days
+        if days < 365.25:
+            calmar = net_real / mdd
+        elif days >= 1:
+            ann_ret = net_real / (days / 365.25)
+            calmar = ann_ret / mdd
+            
     data = {
         "Robot ID": [g["robot_id"].iloc[0] if "robot_id" in g.columns else ""],
         "trades": [int(len(pnl_real))],
@@ -462,12 +493,20 @@ def summary_kpis_robot(g: pd.DataFrame, tcol: str, account_balance: float | None
     if account_balance is not None and account_balance > 0:
         data["dd actual (% cuenta)"] = [dd_info["dd_pct_account"]]
         data["max dd (% cuenta)"] = [dd_info["max_dd_pct_account"]]
+        
     data.update({
-        "ret/dd": [ret_dd],
+        "ret/dd": [ret_dd], "calmar ratio": [calmar],
         "winrate": [float((pnl_real > 0).mean() * 100.0) if len(pnl_real) else 0.0],
         "wins": [wins], "loss": [losses],
         "profit factor": [profit_factor(pnl_real)], "sharpe ratio": [sharpe_per_trade(pnl_real)],
-        "expectancy": [expectancy(pnl_real)], "stability": [stability_r2(equity)],
+        "expectancy": [expectancy(pnl_real)],
+    })
+    
+    if risk_per_trade is not None and risk_per_trade > 0:
+        data["exp (% r)"] = [expectancy(pnl_real) / risk_per_trade]
+        
+    data.update({
+        "stability": [stability_r2(equity)],
         "stagnation": [max_stagnation(g[tcol] if tcol in g.columns else None, equity)],
     })
     return pd.DataFrame(data)
@@ -485,7 +524,6 @@ def render_current_dd_panel(equity: pd.Series, account_balance: float | None = N
     dd_info = current_drawdown_info(equity, account_balance)
     has_balance = account_balance is not None and account_balance > 0
 
-    # Badge color
     if dd_info["is_at_peak"]:
         badge_color, badge_text, border_color = "#00d4aa", "EN PEAK ✓", "#00d4aa"
     elif has_balance:
@@ -547,366 +585,200 @@ def render_current_dd_panel(equity: pd.Series, account_balance: float | None = N
         st.area_chart(uw_df, height=160, color="#ff4d6d")
         st.caption("Underwater equity: distancia al peak acumulado en cada punto.")
 
-# ========= EDGE ANALYTICS =========
-def compute_edge_score(expectancy_current: float, baseline: float) -> int:
-    if baseline == 0:
-        if expectancy_current > 0: return 3
-        elif expectancy_current < 0: return -3
-        return 0
-    ratio = expectancy_current / abs(baseline)
-    if expectancy_current < 0: return -3
-    elif ratio >= 1.3: return 3
-    elif ratio >= 1.1: return 2
-    elif ratio >= 0.9: return 1
-    elif ratio >= 0.7: return 0
-    elif ratio >= 0.5: return -1
-    elif ratio >= 0.2: return -2
-    else: return -3
+# ========= EDGE ANALYTICS (SIMPLIFICADO) =========
+def compute_rolling_expectancy(pnl, window): 
+    return pnl.rolling(window=window, min_periods=window).mean()
 
-def edge_score_label(score: int) -> str:
-    return {3:"🟢 Edge muy por encima del baseline", 2:"🟢 Edge por encima del baseline",
-            1:"🟢 Edge estable", 0:"🟡 Edge levemente por debajo — monitorear",
-            -1:"🟠 Edge en decay moderado", -2:"🔴 Edge en decay severo", -3:"🔴 Edge negativo"}.get(score, "❓ Sin datos")
+def obtener_estado_edge(exp_reciente: float, exp_global: float, baseline: float):
+    if exp_reciente >= baseline and exp_reciente >= exp_global:
+        return "🟢 Sano / En Crecimiento", "#00d4aa", "El mercado actual favorece tu lógica operativa. Déjalo correr."
+    elif exp_reciente >= baseline and exp_reciente < exp_global:
+        return "🟡 Normal / Estable", "#f0c040", "El sistema rinde dentro de lo aceptable, pero por debajo de su promedio histórico. Mantener sin cambios."
+    else:
+        return "🔴 En Decadencia (Alerta)", "#ff4d6d", "El edge estadístico se ha perdido en el régimen actual (por debajo del Baseline). Evaluar apagar o reducir riesgo."
 
-def momentum_score(blocks: list[dict]) -> int | None:
-    if len(blocks) < 2: return None
-    recent = blocks[-3:] if len(blocks) >= 3 else blocks
-    deltas = []
-    for i in range(1, len(recent)):
-        prev_e = recent[i-1]["expectancy"]
-        if prev_e != 0: deltas.append(((recent[i]["expectancy"] - prev_e) / abs(prev_e)) * 100)
-    if not deltas: return None
-    avg = sum(deltas) / len(deltas)
-    if avg >= 15: return 3
-    elif avg >= 5: return 2
-    elif avg >= -5: return 1
-    elif avg >= -15: return 0
-    elif avg >= -30: return -1
-    elif avg >= -50: return -2
-    else: return -3
+def render_resumen_salud_table(df_pos, recent_w, baseline_manual, baseline_trades=20):
+    robots = sorted(df_pos["robot_id"].astype(str).unique())
+    rows_resumen = []
+    
+    for rid_loop in robots:
+        gp = df_pos[df_pos["robot_id"].astype(str)==rid_loop]
+        pnl_loop = gp["real_profit"].fillna(0.0).reset_index(drop=True)
+        if len(pnl_loop) == 0: continue
+        
+        b_exp_loop = float(baseline_manual) if baseline_manual is not None else float(pnl_loop.iloc[:min(baseline_trades, len(pnl_loop))].mean())
+        eg_loop = float(pnl_loop.mean())
+        er_loop = float(pnl_loop.tail(recent_w).mean()) if len(pnl_loop) >= recent_w else eg_loop
+        
+        est_loop, _, _ = obtener_estado_edge(er_loop, eg_loop, b_exp_loop)
+        
+        if eg_loop >= b_exp_loop:
+            est_hist = "🟢 Sano (Sobre Baseline)"
+        elif eg_loop > 0:
+            est_hist = "🟡 Débil (Bajo Baseline)"
+        else:
+            est_hist = "🔴 Negativo"
+        
+        rows_resumen.append({
+            "Robot": rid_loop,
+            "Trades": len(pnl_loop),
+            "Exp. Histórica": eg_loop,
+            f"Exp. Reciente (N={recent_w})": er_loop,
+            "Baseline": b_exp_loop,
+            "Estado Reciente": est_loop.split(" ", 1)[-1] if " " in est_loop else est_loop,
+            "Estado Histórico": est_hist.split(" ", 1)[-1] if " " in est_hist else est_hist
+        })
 
-def momentum_label(score: int | None) -> str:
-    if score is None: return "❓ Sin datos suficientes"
-    return {3:"🟢 Acelerando fuerte",2:"🟢 Mejorando",1:"🟢 Estable",0:"🟡 Desacelerando levemente",
-            -1:"🟠 Decayendo",-2:"🔴 Decayendo rápido",-3:"🔴 Caída pronunciada"}.get(score,"❓")
+    if rows_resumen:
+        df_resumen = pd.DataFrame(rows_resumen)
+        
+        def style_estado(val):
+            val_str = str(val)
+            if "Sano" in val_str: return "color:#00d4aa; font-weight:bold"
+            if "Normal" in val_str or "Débil" in val_str: return "color:#f0c040; font-weight:bold"
+            if "Decadencia" in val_str or "Negativo" in val_str: return "color:#ff4d6d; font-weight:bold"
+            return ""
 
-def confluence_signal(vs_baseline, mom):
-    if vs_baseline is None or mom is None: return "❓ Datos insuficientes", "#888"
-    if vs_baseline >= 2 and mom >= 2: return "🌟 Excelente — edge sólido y en crecimiento", "#00d4aa"
-    elif vs_baseline >= 1 and mom >= 1: return "✅ Positivo — edge sobre baseline y mejorando", "#00d4aa"
-    elif vs_baseline <= -2 and mom <= -2: return "🚨 Atención — decay confirmado en ambas métricas", "#ff4d6d"
-    elif vs_baseline <= -1 and mom <= -1: return "⚠️ Precaución — señales de debilitamiento", "#f0a040"
-    elif (vs_baseline >= 1 and mom <= -1) or (vs_baseline <= -1 and mom >= 1): return "🔍 Investigar — señales contradictorias", "#f0c040"
-    elif vs_baseline >= 1: return "🟡 Sobre baseline, momentum neutral", "#f0c040"
-    elif mom >= 1: return "🟡 Mejorando, aún bajo baseline", "#f0c040"
-    else: return "🟡 Neutral — monitorear evolución", "#f0c040"
+        format_dict = {
+            "Exp. Histórica": "${:.2f}",
+            f"Exp. Reciente (N={recent_w})": "${:.2f}",
+            "Baseline": "${:.2f}"
+        }
+        
+        st.dataframe(
+            df_resumen.style.format(format_dict).map(style_estado, subset=["Estado Reciente", "Estado Histórico"]),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        st.info("Sin datos suficientes para calcular el resumen de salud.")
 
-def compute_rolling_expectancy(pnl, window): return pnl.rolling(window=window, min_periods=window).mean()
-
-def compute_period_blocks(pnl, block_size):
-    blocks, n = [], len(pnl)
-    num_blocks = n // block_size
-    if num_blocks == 0: return blocks
-    for i in range(num_blocks):
-        s, e = i * block_size, (i+1) * block_size
-        chunk = pnl.iloc[s:e]
-        blocks.append({"bloque":i+1,"desde_trade":s+1,"hasta_trade":e,"trades":block_size,
-                        "expectancy":float(chunk.mean()),"winrate":float((chunk>0).mean()*100),"profit_factor":profit_factor(chunk)})
-    rem = n % block_size
-    if rem >= block_size // 2:
-        chunk = pnl.iloc[num_blocks*block_size:]
-        blocks.append({"bloque":num_blocks+1,"desde_trade":num_blocks*block_size+1,"hasta_trade":n,
-                        "trades":rem,"expectancy":float(chunk.mean()),"winrate":float((chunk>0).mean()*100),"profit_factor":profit_factor(chunk)})
-    return blocks
-
-def render_edge_comparison_table(df_pos, tcol, robots, cp_size, mp_size, lp_size, baseline_trades, baseline_manual, account_balance=None):
-    col_b_cp, col_b_mp, col_b_lp = f"B·CP ({cp_size})", f"B·MP ({mp_size})", f"B·LP ({lp_size})"
-    col_m_cp, col_m_mp, col_m_lp = f"M·CP ({cp_size})", f"M·MP ({mp_size})", f"M·LP ({lp_size})"
-    score_cols = [col_b_cp, col_b_mp, col_b_lp, col_m_cp, col_m_mp, col_m_lp]
-    has_bal = account_balance is not None and account_balance > 0
-    summary_rows = []
-    for rid in robots:
-        g = df_pos[df_pos["robot_id"].astype(str)==rid].copy()
-        g = g.sort_values(tcol) if tcol in g.columns else g
-        pnl = g["real_profit"].fillna(0.0).reset_index(drop=True)
-        n = len(pnl)
-        if n < cp_size: continue
-        b_exp = float(baseline_manual) if baseline_manual is not None else float(pnl.iloc[:min(baseline_trades,n)].mean())
-        def last_score(size):
-            bl = compute_period_blocks(pnl, size)
-            return (compute_edge_score(bl[-1]["expectancy"], b_exp), bl) if bl else (None, [])
-        cp_s, cp_bl = last_score(cp_size); mp_s, mp_bl = last_score(mp_size); lp_s, lp_bl = last_score(lp_size)
-        cp_m, mp_m, lp_m = momentum_score(cp_bl), momentum_score(mp_bl), momentum_score(lp_bl)
-        ref_b = lp_s if lp_s is not None else (mp_s if mp_s is not None else cp_s)
-        ref_m = lp_m if lp_m is not None else (mp_m if mp_m is not None else cp_m)
-        conf_text, _ = confluence_signal(ref_b, ref_m)
-        conf_short = conf_text.split("—")[-1].strip() if "—" in conf_text else conf_text.split(" ",1)[-1]
-        equity = pnl.cumsum()
-        dd_info = current_drawdown_info(equity, account_balance)
-        dd_pct = dd_info["dd_pct_account"] if has_bal else None
-        dd_sev = dd_severity_label(dd_pct, dd_info["is_at_peak"])
-        nv = lambda s: s if s is not None else pd.NA
-        row = {"Robot":rid,"Trades":n,col_b_cp:nv(cp_s),col_b_mp:nv(mp_s),col_b_lp:nv(lp_s),
-               col_m_cp:nv(cp_m),col_m_mp:nv(mp_m),col_m_lp:nv(lp_m)}
-        if has_bal: row["DD%Cta"] = dd_pct if dd_pct is not None else 0.0
-        row.update({"DD Estado":dd_sev,"Confluencia":conf_short,"Exp.Base":round(b_exp,3)})
-        summary_rows.append(row)
-    if not summary_rows:
-        st.info(f"Se necesitan al menos {cp_size} trades por robot."); return
-    df_s = pd.DataFrame(summary_rows)
-    for c in score_cols:
-        if c in df_s.columns: df_s[c] = pd.array(df_s[c], dtype="Int64")
-    def cs(val):
-        try:
-            v=int(val)
-            if v>=2: return "color:#00d4aa;font-weight:bold"
-            if v==1: return "color:#00d4aa"
-            if v==0: return "color:#f0c040"
-            if v==-1: return "color:#f0a040"
-            return "color:#ff4d6d;font-weight:bold"
-        except: return "color:#888"
-    def cc(val):
-        v=str(val).lower()
-        if any(k in v for k in ["excelente","positivo","sólido"]): return "color:#00d4aa;font-weight:bold"
-        if any(k in v for k in ["atención","decay","precaución"]): return "color:#ff4d6d;font-weight:bold"
-        return ""
-    def cdd(val):
-        try:
-            v=float(val)
-            if v<0.01: return "color:#00d4aa;font-weight:bold"
-            if v<2: return "color:#00d4aa"
-            if v<5: return "color:#f0c040"
-            if v<10: return "color:#f0a040;font-weight:bold"
-            return "color:#ff4d6d;font-weight:bold"
-        except: return ""
-    def cde(val):
-        v=str(val).lower()
-        if "peak" in v: return "color:#00d4aa;font-weight:bold"
-        if "leve" in v: return "color:#00d4aa"
-        if "moderado" in v: return "color:#f0c040"
-        if "elevado" in v: return "color:#f0a040;font-weight:bold"
-        if "severo" in v: return "color:#ff4d6d;font-weight:bold"
-        return ""
-    ps = [c for c in score_cols if c in df_s.columns]
-    fm = {c:(lambda v: f"+{int(v)}" if int(v)>0 else str(int(v)) if pd.notna(v) else "—") for c in ps}
-    if has_bal and "DD%Cta" in df_s.columns: fm["DD%Cta"] = "{:.2f}%"
-    sty = df_s.style.map(cs,subset=ps).map(cc,subset=["Confluencia"]).map(cde,subset=["DD Estado"]).format(fm,na_rep="—")
-    if has_bal and "DD%Cta" in df_s.columns: sty = sty.map(cdd,subset=["DD%Cta"])
-    co = ["Robot","Trades"]+ps
-    if has_bal and "DD%Cta" in df_s.columns: co.append("DD%Cta")
-    co += ["DD Estado","Confluencia","Exp.Base"]
-    st.dataframe(sty, use_container_width=True, hide_index=True, column_order=co)
-
-def render_edge_tab(df_pos, tcol, account_balance=None):
+def render_edge_tab(df_pos, tcol, account_balance=None, risk_per_trade=None):
     st.markdown("""<style>
     .edge-card{background:#0f1117;border:1px solid #2a2d3e;border-radius:12px;padding:16px 20px;margin-bottom:12px}
     </style>""", unsafe_allow_html=True)
-    st.subheader("🎯 Edge Analytics — Detección y Medición de Vida del Edge")
-    st.caption("Monitorea si el edge de cada sistema está en crecimiento, estable o en decaimiento.")
-    robots = sorted(df_pos["robot_id"].astype(str).unique())
-    if not robots: st.warning("No hay robots disponibles."); return
-    st.markdown("#### 🤖 Seleccionar Robot")
-    robot_options = {f"🤖 {rid}  ({len(df_pos[df_pos['robot_id'].astype(str)==rid])} trades)": rid for rid in robots}
-    selected_rid = robot_options[st.selectbox("Robot a analizar:", list(robot_options.keys()), key="edge_robot_selector")]
-    st.markdown("---")
-    st.markdown("#### ⚙️ Configuración de períodos")
-    c1,c2,c3 = st.columns(3)
-    cp_size = c1.number_input("Corto Plazo (trades)", min_value=5, max_value=50, value=10, step=5, key="edge_cp_size")
-    mp_size = c2.number_input("Medio Plazo (trades)", min_value=10, max_value=100, value=20, step=5, key="edge_mp_size")
-    lp_size = c3.number_input("Largo Plazo (trades)", min_value=20, max_value=200, value=50, step=10, key="edge_lp_size")
-    st.markdown("#### 📐 Baseline de Expectancy")
-    baseline_mode = st.radio("Fuente del baseline:",
-        options=["📊 Automático (primeros N trades)", "✏️ Manual (desde backtesting)"],
-        horizontal=True, key="edge_baseline_mode")
+    
+    st.subheader("🎯 Dashboard de Control de Mando — Vida del Edge")
+    st.caption("Detecta rápidamente si el edge de tu sistema está sano, estable o en decadencia comparando su rendimiento reciente contra el histórico y tu objetivo.")
+    
+    edge_robots = sorted(df_pos["robot_id"].astype(str).unique())
+    if not edge_robots: 
+        st.warning("No hay robots disponibles."); return
+
+    # --- Configuración Superior ---
+    st.markdown("#### ⚙️ Configuración del Análisis")
+    c1, c2, c3 = st.columns([1, 1.5, 1])
+    
+    # Selector Sincronizado
+    def format_robot_option(rid):
+        n_trades = len(df_pos[df_pos['robot_id'].astype(str)==rid])
+        return f"🤖 {rid} ({n_trades} trades)"
+        
+    idx4 = edge_robots.index(st.session_state.global_robot) if st.session_state.global_robot in edge_robots else 0
+    selected_rid = c1.selectbox(
+        "Seleccionar Robot:", 
+        edge_robots, 
+        index=idx4, 
+        format_func=format_robot_option, 
+        key="tab4_robot", 
+        on_change=lambda: st.session_state.update(global_robot=st.session_state.tab4_robot)
+    )
+    
+    recent_w = c2.number_input("Ventana 'Reciente' (Cantidad de Trades)", min_value=5, max_value=200, value=20, step=5, 
+                               help="Cantidad de trades a considerar para evaluar si el sistema funciona 'ahora mismo'.")
+                               
+    baseline_mode = c3.radio("Fuente del Baseline:",
+        options=["📊 Automático (1ros N)", "✏️ Manual", "🎯 % del Riesgo"],
+        horizontal=False, key="edge_baseline_mode", index=2)
+
+    # --- Lógica del Baseline ---
     if baseline_mode.startswith("📊"):
-        bc1, bc2 = st.columns([1, 3])
-        baseline_trades = bc1.number_input("Primeros N trades", min_value=10, max_value=200, value=20, step=10, key="edge_baseline_trades")
+        b_col1, b_col2 = st.columns([1, 3])
+        baseline_trades = b_col1.number_input("Primeros N trades", min_value=10, max_value=200, value=20, step=10)
         baseline_manual = None
         _g = df_pos[df_pos["robot_id"].astype(str)==selected_rid]
         _pnl = _g["real_profit"].fillna(0.0).reset_index(drop=True)
         if len(_pnl) > 0:
             _bn = min(baseline_trades, len(_pnl))
-            _bc = float(_pnl.iloc[:_bn].mean())
-            _co = "#00d4aa" if _bc > 0 else "#f87171"
-            bc2.markdown(f"<div style='background:{_co}18;border:1px solid {_co};border-radius:6px;padding:8px 14px;margin-top:4px'>"
-                         f"<span style='font-size:.75rem;color:#8b949e'>Baseline ({_bn} de {len(_pnl)} trades)</span><br>"
-                         f"<span style='font-size:1.3rem;font-weight:900;color:{_co}'>${_bc:.2f}</span>"
-                         f"<span style='font-size:.8rem;color:#8b949e'> / trade</span></div>", unsafe_allow_html=True)
-    else:
-        bc1, bc2 = st.columns([1, 3])
-        baseline_manual = bc1.number_input("Expectancy baseline ($/trade)", min_value=-1000.0, max_value=10000.0, value=0.0, step=0.01, format="%.2f", key="baseline_manual_input")
+            baseline_val_display = float(_pnl.iloc[:_bn].mean())
+    elif baseline_mode.startswith("✏️"):
+        b_col1, b_col2 = st.columns([1, 3])
+        baseline_manual = b_col1.number_input("Expectancy objetivo ($/trade)", min_value=-1000.0, max_value=10000.0, value=0.0, step=0.01, format="%.2f")
         baseline_trades = 20
-        bc2.info(f"📌 Baseline manual: **${baseline_manual:.2f}** / trade")
+        baseline_val_display = baseline_manual
+    else: # 🎯 % del Riesgo
+        b_col1, b_col2 = st.columns([1, 3])
+        if risk_per_trade is None or risk_per_trade <= 0:
+            st.warning("⚠️ Configura el 'Riesgo por Trade' en la barra lateral para usar esta opción.")
+            baseline_manual = 0.0
+            baseline_trades = 20
+        else:
+            target_pct = b_col1.number_input("Objetivo (% del Riesgo)", min_value=0.0, max_value=500.0, value=9.0, step=1.0)
+            baseline_manual = risk_per_trade * (target_pct / 100.0)
+            baseline_trades = 20
+        baseline_val_display = baseline_manual
+        
     st.markdown("---")
 
-    rid = selected_rid
-    g = df_pos[df_pos["robot_id"].astype(str)==rid].copy()
+    # --- Extracción de Datos del Robot Seleccionado ---
+    g = df_pos[df_pos["robot_id"].astype(str)==selected_rid].copy()
     g = g.sort_values(tcol) if tcol in g.columns else g
     pnl = g["real_profit"].fillna(0.0).reset_index(drop=True)
     n_trades = len(pnl)
-    st.markdown(f"### 🤖 {rid} — {n_trades} trades totales")
-    if n_trades < cp_size:
-        st.info(f"⚠️ Mínimo {cp_size} trades necesarios. Actuales: {n_trades}")
-    else:
-        equity_for_dd = pnl.cumsum()
-        st.markdown("##### 📉 Drawdown en curso")
-        render_current_dd_panel(equity_for_dd, account_balance, g[tcol] if tcol in g.columns else None)
-        st.markdown("---")
-        baseline_exp = float(baseline_manual) if baseline_manual is not None else float(pnl.iloc[:min(baseline_trades,n_trades)].mean())
-        baseline_desc = f"Manual — ${baseline_exp:.2f}/trade" if baseline_manual is not None else f"Auto ({min(baseline_trades,n_trades)} trades) — ${baseline_exp:.2f}/trade"
-        def get_last_blocks(size, mx=3):
-            bl = compute_period_blocks(pnl, size)
-            return bl[-mx:] if bl else []
-        cp_bl, mp_bl, lp_bl = get_last_blocks(cp_size), get_last_blocks(mp_size), get_last_blocks(lp_size)
-        bts = lambda bl: [compute_edge_score(b["expectancy"], baseline_exp) for b in bl]
-        cp_sc, mp_sc, lp_sc = bts(cp_bl), bts(mp_bl), bts(lp_bl)
-        cp_now, mp_now, lp_now = (cp_sc[-1] if cp_sc else None), (mp_sc[-1] if mp_sc else None), (lp_sc[-1] if lp_sc else None)
-        cp_mom, mp_mom, lp_mom = momentum_score(cp_bl), momentum_score(mp_bl), momentum_score(lp_bl)
-        ref_b = lp_now if lp_now is not None else (mp_now if mp_now is not None else cp_now)
-        ref_m = lp_mom if lp_mom is not None else (mp_mom if mp_mom is not None else cp_mom)
-        conf_text, conf_color = confluence_signal(ref_b, ref_m)
-        st.markdown(f"<div style='background:{conf_color}22;border-left:4px solid {conf_color};padding:12px 16px;border-radius:8px;margin-bottom:16px;'>"
-                    f"<span style='font-size:1.05rem;font-weight:600;color:{conf_color};'>{conf_text}</span>"
-                    f"<span style='color:#888;font-size:0.8rem;margin-left:12px;'>Señal de confluencia</span></div>", unsafe_allow_html=True)
-        st.markdown("##### 📊 Score por horizonte")
-        fs = lambda s: ("—" if s is None else (f"+{s}" if s > 0 else str(s)))
-        score_data = {
-            "Horizonte":[f"Corto ({cp_size})",f"Medio ({mp_size})",f"Largo ({lp_size})"],
-            "vs Baseline":[fs(cp_now),fs(mp_now),fs(lp_now)],
-            "Estado Baseline":[edge_score_label(x).split(" ",1)[-1] if x is not None else "—" for x in [cp_now,mp_now,lp_now]],
-            "Momentum":[fs(cp_mom),fs(mp_mom),fs(lp_mom)],
-            "Estado Momentum":[momentum_label(x).split(" ",1)[-1] if x is not None else "—" for x in [cp_mom,mp_mom,lp_mom]],
-        }
-        df_sc = pd.DataFrame(score_data)
-        def csc(val):
-            try:
-                v=int(str(val).replace("+",""))
-                if v>=2: return "color:#00d4aa;font-weight:bold"
-                if v==1: return "color:#00d4aa"
-                if v==0: return "color:#f0c040"
-                if v==-1: return "color:#f0a040"
-                return "color:#ff4d6d;font-weight:bold"
-            except: return "color:#888"
-        st.dataframe(df_sc.style.map(csc,subset=["vs Baseline","Momentum"]), use_container_width=True, hide_index=True)
-        st.caption(f"Baseline: {baseline_desc}")
-        st.markdown("---")
-        st.markdown("##### 📋 Historial de bloques por período")
-        tab_cp, tab_mp, tab_lp = st.tabs([f"CP ({cp_size})", f"MP ({mp_size})", f"LP ({lp_size})"])
-        def render_blocks_table(tab, blocks, scores, bexp, rdp=-20.0):
-            with tab:
-                if not blocks: st.info("Insuficientes trades."); return
-                rows, prev_s, prev_e, alerts = [], None, None, []
-                for i,(b,s) in enumerate(zip(blocks,scores)):
-                    ds = "—" if prev_s is None else f"{'↑' if s-prev_s>0 else '↓' if s-prev_s<0 else '→'} {s-prev_s:+d}"
-                    if prev_e is None or prev_e==0: dp="—"
-                    else:
-                        pct=((b["expectancy"]-prev_e)/abs(prev_e))*100
-                        dp=f"{'📈' if pct>0 else '📉'} {pct:+.1f}%"
-                        if pct<=rdp: alerts.append(f"⚡ Decay rápido bloque #{b['bloque']}: {pct:.1f}%")
-                    vb = f"{((b['expectancy']-bexp)/abs(bexp))*100:+.1f}%" if bexp!=0 else "—"
-                    rows.append({"Bloque":f"#{b['bloque']}","Trades":f"{b['desde_trade']}–{b['hasta_trade']}","N":b["trades"],
-                                 "Expectancy":round(b["expectancy"],3),"Δ% Exp":dp,"vs Baseline":vb,
-                                 "Win Rate":f"{b['winrate']:.1f}%","PF":round(b["profit_factor"],2),
-                                 "Score":f"{'+' if s>0 else ''}{s}","Δ Score":ds,"Estado":edge_score_label(s)})
-                    prev_s, prev_e = s, b["expectancy"]
-                dfb = pd.DataFrame(rows)
-                def cs2(v):
-                    try:
-                        x=int(str(v).replace("+",""))
-                        return "color:#00d4aa;font-weight:bold" if x>=1 else ("color:#ff4d6d;font-weight:bold" if x<=-1 else "color:#f0c040;font-weight:bold")
-                    except: return ""
-                def cdp(v):
-                    if v=="—" or not isinstance(v,str): return ""
-                    try:
-                        n=float(v.replace("📈","").replace("📉","").replace("%","").strip())
-                        return "color:#00d4aa" if n>=0 else ("color:#ff4d6d;font-weight:bold" if n<=rdp else "color:#f0a040")
-                    except: return ""
-                def cvb(v):
-                    if v=="—": return ""
-                    try:
-                        n=float(str(v).replace("%","").strip())
-                        return "color:#00d4aa" if n>=10 else ("color:#f0c040" if n>=-10 else "color:#ff4d6d")
-                    except: return ""
-                st.dataframe(dfb.style.map(cs2,subset=["Score"]).map(cdp,subset=["Δ% Exp"]).map(cvb,subset=["vs Baseline"]),
-                             use_container_width=True, hide_index=True)
-                for a in alerts: st.error(a)
-                if len(blocks)>1:
-                    cd=pd.DataFrame({"Bloque":[f"#{b['bloque']}" for b in blocks],"Expectancy":[b["expectancy"] for b in blocks],
-                                     "Baseline":[bexp]*len(blocks)}).set_index("Bloque")
-                    st.line_chart(cd, height=180); st.caption("Expectancy por bloque vs Baseline")
-        render_blocks_table(tab_cp, cp_bl, cp_sc, baseline_exp)
-        render_blocks_table(tab_mp, mp_bl, mp_sc, baseline_exp)
-        render_blocks_table(tab_lp, lp_bl, lp_sc, baseline_exp)
-        st.markdown("---")
-        st.markdown("##### 📈 Expectancy rolling continua")
-        roll_w = st.slider("Ventana rolling", min_value=5, max_value=min(100,n_trades), value=min(mp_size,n_trades), key="edge_roll_window")
-        roll_exp = compute_rolling_expectancy(pnl, roll_w).dropna()
-        if not roll_exp.empty:
-            st.line_chart(pd.DataFrame({"Rolling":roll_exp.values,"Baseline":[baseline_exp]*len(roll_exp),"Cero":[0.0]*len(roll_exp)},
-                                       index=range(1,len(roll_exp)+1)), height=220)
-            st.caption(f"Rolling {roll_w} trades. Azul bajo naranja → decay.")
-        else: st.info(f"Se necesitan {roll_w}+ trades.")
-        st.markdown("##### 🔔 Estado del sistema")
-        good, watch, alert = [], [], []
-        dd_a = current_drawdown_info(equity_for_dd, account_balance)
-        hb = account_balance is not None and account_balance > 0
-        if dd_a["is_at_peak"]: good.append("🏔️ **Equity en máximo histórico**")
-        elif hb:
-            pa = dd_a["dd_pct_account"]
-            if pa >= 10: alert.append(f"🚨 **DD severo**: ${dd_a['current_dd']:.2f} = **{pa:.2f}%** de la cuenta")
-            elif pa >= 5: alert.append(f"⚠️ **DD elevado**: {pa:.2f}% de la cuenta")
-            elif pa >= 2: watch.append(f"📉 **DD moderado**: {pa:.2f}% de la cuenta")
-        else:
-            r = dd_a["dd_ratio"]
-            if r >= 0.8: alert.append(f"🚨 **DD severo**: {r*100:.0f}% del Max DD")
-            elif r >= 0.5: watch.append(f"⚠️ **DD elevado**: {r*100:.0f}% del Max DD")
-        if lp_now is not None and lp_now >= 2: good.append(f"🌟 **LP sobre baseline** (score {fs(lp_now)})")
-        if lp_mom is not None and lp_mom >= 2: good.append("📈 **Momentum positivo LP**")
-        if ref_b is not None and ref_b >= 2 and ref_m is not None and ref_m >= 2: good.append("🌟 **Confluencia positiva**")
-        if cp_now is not None and cp_now <= -1 and (mp_now is None or mp_now >= 0): watch.append(f"🔍 **CP bajo baseline** ({fs(cp_now)})")
-        if mp_mom is not None and mp_mom <= -1 and (lp_mom is None or lp_mom >= 0): watch.append("🔍 **Momentum MP desacelerando**")
-        if mp_now is not None and mp_now <= -2: alert.append(f"⚠️ **MP decay severo** ({fs(mp_now)})")
-        if lp_now is not None and lp_now <= -2: alert.append(f"🚨 **LP decay severo** ({fs(lp_now)})")
-        if ref_b is not None and ref_b <= -1 and ref_m is not None and ref_m <= -1: alert.append("🚨 **Confluencia negativa**")
-        def chk(bl,nm):
-            r=[]
-            for i in range(1,len(bl)):
-                pe=bl[i-1]["expectancy"]
-                if pe!=0:
-                    p=((bl[i]["expectancy"]-pe)/abs(pe))*100
-                    if p<=-20: r.append(f"⚡ **Caída en {nm} #{bl[i]['bloque']}**: {p:.1f}%")
-            return r
-        for r in chk(mp_bl,"MP"): alert.append(r)
-        for r in chk(lp_bl,"LP"): alert.append(r)
-        for s in good: st.success(s)
-        for s in watch: st.warning(s)
-        for s in alert: st.error(s)
-        if not good and not watch and not alert: st.info("ℹ️ Sistema dentro de parámetros normales")
-    st.markdown("---")
-    st.markdown("#### 🏆 Comparativa de Edge — Todos los Robots")
-    render_edge_comparison_table(df_pos, tcol, robots, cp_size, mp_size, lp_size, baseline_trades, baseline_manual, account_balance)
-    with st.expander("📖 Leyenda"):
-        st.markdown("""
-### Scores
-| Score | vs Baseline | Momentum |
-|-------|-------------|----------|
-| **+3** | ≥130% baseline | Acelerando ≥+15% |
-| **+2** | ≥110% | Mejorando +5..15% |
-| **+1** | 90-110% | Estable ±5% |
-| **0** | 70-90% | Desacelerando -5..-15% |
-| **-1** | 50-70% | Decayendo -15..-30% |
-| **-2** | <50% | Rápido -30..-50% |
-| **-3** | Negativa | Pronunciada <-50% |
+    
+    if n_trades < recent_w:
+        st.info(f"⚠️ El robot tiene {n_trades} trades. Se requieren al menos {recent_w} para un análisis completo de la ventana reciente.")
+    
+    # Cálculos Clave
+    baseline_exp = float(baseline_manual) if baseline_manual is not None else float(pnl.iloc[:min(baseline_trades, n_trades)].mean())
+    exp_global = float(pnl.mean())
+    exp_reciente = float(pnl.tail(recent_w).mean()) if n_trades >= recent_w else exp_global
+    
+    estado_str, color_str, msj_str = obtener_estado_edge(exp_reciente, exp_global, baseline_exp)
 
-### DD en curso (% cuenta)
-| DD% | Severidad |
-|-----|-----------|
-| 0% | 🟢 En peak |
-| <2% | 🟢 Leve |
-| 2-5% | 🟡 Moderado |
-| 5-10% | 🟠 Elevado |
-| ≥10% | 🔴 Severo |
-        """)
+    # --- 1. BANNER DIAGNÓSTICO (SEMÁFORO) ---
+    st.markdown(f"### Análisis para: {selected_rid}")
+    st.markdown(
+        f"<div style='background:{color_str}18; border-left:6px solid {color_str}; padding:20px; border-radius:8px; margin-bottom:24px;'>"
+        f"<h2 style='color:{color_str}; margin-top:0; padding-top:0;'>{estado_str}</h2>"
+        f"<p style='font-size:1.1rem; color:#d1d5db; margin-bottom:0;'>{msj_str}</p>"
+        f"</div>", 
+        unsafe_allow_html=True
+    )
+
+    # --- 2. TARJETAS DE MÉTRICAS ---
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Expectancy Global (Histórica)", f"${exp_global:.2f}", help="Promedio de beneficio de todos los trades del sistema.")
+    
+    delta_vs_base = exp_reciente - baseline_exp
+    m2.metric(f"Expectancy Reciente (Últimos {recent_w})", f"${exp_reciente:.2f}", f"{delta_vs_base:+.2f} vs Baseline", 
+              delta_color="normal" if delta_vs_base >= 0 else "inverse", help="Rendimiento del sistema en el mercado actual.")
+    
+    m3.metric("Baseline (Mínimo Aceptable)", f"${baseline_exp:.2f}", help="El nivel mínimo de expectancy que le exiges a tu sistema.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- 3. GRÁFICO ROLLING EXPECTANCY ---
+    st.markdown("#### 📈 Evolución del Edge (Rolling Expectancy)")
+    st.caption(f"La línea azul muestra el rendimiento promedio tomando ventanas móviles de **{recent_w} trades**. Mientras esté por encima de la línea punteada (Baseline), tu sistema está sano.")
+    
+    roll_exp = compute_rolling_expectancy(pnl, recent_w).dropna()
+    if not roll_exp.empty:
+        df_chart = pd.DataFrame({
+            "Expectancy Reciente": roll_exp.values,
+            "Baseline": [baseline_exp] * len(roll_exp),
+            "Cero": [0.0] * len(roll_exp)
+        }, index=range(1, len(roll_exp) + 1))
+        
+        st.line_chart(df_chart, height=350, color=["#3b82f6", "#00d4aa", "#ff4d6d"])
+    else:
+        st.info("No hay suficientes datos para graficar la ventana móvil.")
+
+    st.markdown("---")
+
+    # --- 4. RESUMEN DE TODOS LOS SISTEMAS ---
+    st.markdown("#### 🏆 Resumen de Salud — Todos los Robots")
+    render_resumen_salud_table(df_pos, recent_w, baseline_manual, baseline_trades)
+
 
 # ==========================================
 # ⚙️ SIDEBAR
@@ -929,12 +801,16 @@ if account_balance <= 0:
 else:
     st.sidebar.caption(f"✅ Balance: **${account_balance:,.2f}**")
 
+risk_per_trade = st.sidebar.number_input(
+    "💸 Riesgo por Trade ($)", min_value=0.0, max_value=1_000_000.0, value=0.0, step=10.0, format="%.2f",
+    help="Riesgo en dinero por operación. Usado para normalizar la Expectancy (% del Riesgo) y para Edge Analytics.")
+
 st.sidebar.markdown("---")
 agrupar_por = st.sidebar.radio("Agrupar robots por:", ["Comment", "Magic Number"])
 fusionar_archivos = st.sidebar.checkbox("🔗 Fusionar historiales", value=False)
 
 def clean_id(x):
-    if pd.isna(x) or str(x).strip() == "": return "UNKNOWN"
+    if pd.isna(x) or str(x).strip() in ["", "nan"]: return "UNKNOWN"
     sx = str(x).strip()
     return sx[:-2] if sx.endswith(".0") else sx
 
@@ -948,32 +824,64 @@ with st.spinner("⏳ Procesando..."):
         elif suffix == "csv":
             if _is_deals_csv(file_bytes):
                 df_temp = parse_mt5_deals_csv(file_bytes)
-                if "Magic" in df_temp.columns:
-                    df_temp["robot_id"] = df_temp["Magic"].apply(clean_id)
-                    mask = df_temp["robot_id"]=="UNKNOWN"
-                    if mask.any(): df_temp.loc[mask,"robot_id"] = df_temp.loc[mask,"symbol"].astype(str)+"_UNKNOWN"
-                    if not fusionar_archivos: df_temp["robot_id"] = df_temp["robot_id"].astype(str)+f" [{uploaded.name}]"
-                    df_temp["source_file"] = uploaded.name
-                    all_dfs.append(df_temp)
-                    st.sidebar.success(f"✅ Deals CSV: {uploaded.name}")
-                    continue
+                st.sidebar.success(f"✅ Deals CSV: {uploaded.name}")
             else: df_temp = parse_csv(BytesIO(file_bytes))
         elif suffix in ("htm","html"): df_temp = parse_mt4_html(file_bytes)
         else: st.sidebar.error(f"No soportado: {uploaded.name}"); continue
+        
         if df_temp.empty: st.sidebar.warning(f"Sin operaciones: {uploaded.name}"); continue
-        col_target = "Magic" if agrupar_por == "Magic Number" else "Comment"
-        df_temp["robot_id"] = df_temp[col_target].apply(clean_id) if col_target in df_temp.columns else "UNKNOWN"
-        mask = df_temp["robot_id"]=="UNKNOWN"
-        if mask.any(): df_temp.loc[mask,"robot_id"] = df_temp.loc[mask,"symbol"].astype(str)+"_UNKNOWN"
-        if not fusionar_archivos: df_temp["robot_id"] = df_temp["robot_id"].astype(str)+f" [{uploaded.name}]"
+        
+        # --- Limpieza de IDs unificada ---
+        if "Comment" not in df_temp.columns: df_temp["Comment"] = np.nan
+        if "Magic" not in df_temp.columns: df_temp["Magic"] = np.nan
+
+        c_col = df_temp["Comment"].apply(lambda x: str(x).strip() if pd.notna(x) and str(x).strip() not in ["", "nan"] else "")
+        m_col = df_temp["Magic"].apply(clean_id)
+
+        df_temp["clean_comment"] = c_col
+        df_temp["clean_magic"] = m_col
+
+        mask_m = (df_temp["clean_magic"] == "UNKNOWN") | (df_temp["clean_magic"] == "")
+        if mask_m.any() and "symbol" in df_temp.columns:
+            df_temp.loc[mask_m, "clean_magic"] = df_temp.loc[mask_m, "symbol"].astype(str) + "_UNKNOWN"
+
         df_temp["source_file"] = uploaded.name
         all_dfs.append(df_temp)
+
     except Exception as e:
         st.sidebar.error(f"Error: {uploaded.name}")
         st.sidebar.exception(e)
 
 if not all_dfs: st.stop()
 df_pos_full = pd.concat(all_dfs, ignore_index=True)
+
+# --- Construcción Definitiva del Robot ID ---
+if agrupar_por == "Magic Number":
+    if fusionar_archivos:
+        agg_comments = df_pos_full.groupby("clean_magic")["clean_comment"].apply(
+            lambda x: " ".join(sorted(set(filter(None, x))))
+        )
+        df_pos_full["robot_id"] = df_pos_full["clean_magic"].apply(
+            lambda m: f"({m}) {agg_comments[m]}".strip() if agg_comments.get(m, "") else f"({m})"
+        )
+    else:
+        agg_comments = df_pos_full.groupby(["clean_magic", "source_file"])["clean_comment"].apply(
+            lambda x: " ".join(sorted(set(filter(None, x))))
+        )
+        def make_id(row):
+            m = row["clean_magic"]
+            f = row["source_file"]
+            c_str = agg_comments.loc[(m, f)] if (m, f) in agg_comments.index else ""
+            base = f"({m}) {c_str}".strip() if c_str else f"({m})"
+            return f"{base} [{f}]"
+        df_pos_full["robot_id"] = df_pos_full.apply(make_id, axis=1)
+else:
+    base_id = np.where(df_pos_full["clean_comment"] != "", df_pos_full["clean_comment"], df_pos_full["clean_magic"])
+    if fusionar_archivos:
+        df_pos_full["robot_id"] = base_id
+    else:
+        df_pos_full["robot_id"] = base_id + " [" + df_pos_full["source_file"] + "]"
+
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔎 Filtros")
@@ -984,11 +892,17 @@ if not selected_symbols: st.warning("⚠️ Seleccioná al menos un símbolo.");
 st.sidebar.markdown("---")
 st.sidebar.header("🤖 Filtros de Robots")
 min_trades_filter = st.sidebar.number_input("Mínimo trades/robot", min_value=1, max_value=500, value=1, step=1)
+
 tcol_full = "close_time" if ("close_time" in df_pos_full.columns and df_pos_full["close_time"].notna().any()) else "open_time"
 all_robot_dates = df_pos_full.groupby("robot_id")[tcol_full].max().dropna()
-gmin = all_robot_dates.min().date() if not all_robot_dates.empty else None
+
+abs_min_date = df_pos_full[tcol_full].min().date() if not df_pos_full.empty else None
 gmax = all_robot_dates.max().date() if not all_robot_dates.empty else None
-last_activity_after = st.sidebar.date_input("Último trade después de", value=gmin, min_value=gmin, max_value=gmax) if gmin and gmax and gmin<gmax else None
+
+if abs_min_date and gmax:
+    last_activity_after = st.sidebar.date_input("Último trade después de", value=abs_min_date, min_value=abs_min_date, max_value=gmax)
+else:
+    last_activity_after = None
 
 df_pos = df_pos_full[df_pos_full["symbol"].isin(selected_symbols)].copy()
 if df_pos.empty: st.warning("Sin operaciones para esos símbolos."); st.stop()
@@ -1006,7 +920,16 @@ if nf > 0: st.sidebar.caption(f"🔍 {nf} robot(s) ocultados.")
 # ==========================================
 # 📈 MAIN
 # ==========================================
-kpis_df, key_used, tcol = kpis_por_robot(df_pos, account_balance)
+kpis_df, key_used, tcol = kpis_por_robot(df_pos, account_balance, risk_per_trade)
+
+# --- Sincronizador Global de Robot ---
+robots_list = sorted(kpis_df['Robot ID'].astype(str).unique())
+if "global_robot" not in st.session_state or st.session_state.global_robot not in robots_list:
+    st.session_state.global_robot = robots_list[0] if len(robots_list) > 0 else None
+
+def sync_robot_cb(key):
+    st.session_state.global_robot = st.session_state[key]
+# ------------------------------------
 
 st.markdown("""<script>
 (function(){function w(){document.querySelectorAll('[data-baseweb="tab"]').forEach(function(t,i){
@@ -1015,17 +938,40 @@ u.searchParams.set('tab',k[i]||'kpis');window.history.replaceState({},'',u.toStr
 setTimeout(w,800);new MutationObserver(function(){setTimeout(w,300)}).observe(document.body,{childList:true,subtree:true})})();
 </script>""", unsafe_allow_html=True)
 
-tab_kpis, tab_robot, tab_edge = st.tabs(["📊 KPIs Globales", "🔎 Análisis por Robot", "🎯 Edge Analytics"])
+tab_kpis, tab_robot, tab_dd, tab_edge = st.tabs(["📊 KPIs Globales", "🔎 Análisis por Robot", "📉 Drawdown", "🎯 Edge Analytics"])
 
 with tab_kpis:
     st.subheader(f"📊 KPIs por Robot (Agrupado por {agrupar_por})")
     has_bal = account_balance is not None and account_balance > 0
     kd = kpis_df.copy()
     kd["DD Estado"] = kd.apply(lambda r: dd_severity_label(r.get("DD % Cuenta") if has_bal else None, r["En Peak"]), axis=1)
-    dc = ["Robot ID","Net profit (real)","# Trades","% Wins","PF","Expectancy","Ret/DD","Max DD","DD Actual"]
-    if has_bal: dc += ["DD % Cuenta","Max DD % Cuenta"]
-    dc += ["DD Estado","Trades s/Peak","Desde","Hasta","Símbolos"]
+    
+    dc = ["Robot ID", "Net profit (real)", "Stability", "Calmar", "Expectancy"]
+    if risk_per_trade and risk_per_trade > 0:
+        dc.append("Exp (% R)")
+    dc += ["PF", "% Wins", "# Trades", "Max DD", "DD Actual"]
+    if has_bal: dc += ["DD % Cuenta", "Max DD % Cuenta"]
+    dc += ["DD Estado", "Ret/DD", "Trades s/Peak", "Desde", "Hasta", "Símbolos", "Archivo"]
     dc = [c for c in dc if c in kd.columns]
+    
+    def color_stability(val):
+        if pd.isna(val): return ""
+        if val >= 0.7: return "color:#00d4aa;font-weight:bold"
+        if val < 0.6: return "color:#ff4d6d;font-weight:bold"
+        return "color:#f0c040"
+        
+    def color_calmar(val):
+        if pd.isna(val): return ""
+        if val >= 1.0: return "color:#00d4aa;font-weight:bold"
+        if val < 0.8: return "color:#ff4d6d;font-weight:bold"
+        return "color:#f0c040"
+        
+    def color_exp_r(val):
+        if pd.isna(val): return ""
+        if val >= 0.20: return "color:#00d4aa;font-weight:bold"
+        if val < 0.09: return "color:#ff4d6d;font-weight:bold"
+        return "color:#f0c040"
+        
     def cde(v):
         v2=str(v).lower()
         if "peak" in v2: return "color:#00d4aa;font-weight:bold"
@@ -1034,6 +980,7 @@ with tab_kpis:
         if "elevado" in v2: return "color:#f0a040;font-weight:bold"
         if "severo" in v2: return "color:#ff4d6d;font-weight:bold"
         return ""
+        
     def cdp(v):
         try:
             x=float(v)
@@ -1043,21 +990,34 @@ with tab_kpis:
             if x<10: return "color:#f0a040;font-weight:bold"
             return "color:#ff4d6d;font-weight:bold"
         except: return ""
-    fm={"Net profit (real)":"{:.2f}","% Wins":"{:.2f}%","PF":"{:.2f}","Expectancy":"{:.2f}","Ret/DD":"{:.2f}","Max DD":"{:.2f}","DD Actual":"{:.2f}"}
+
+    fm={"Net profit (real)":"{:.2f}","% Wins":"{:.2f}%","PF":"{:.2f}","Expectancy":"{:.2f}",
+        "Stability":"{:.2f}","Calmar":"{:.2f}","Ret/DD":"{:.2f}","Max DD":"{:.2f}","DD Actual":"{:.2f}"}
+    if "Exp (% R)" in dc: fm["Exp (% R)"] = "{:.2%}"
     if has_bal: fm["DD % Cuenta"]="{:.2f}%"; fm["Max DD % Cuenta"]="{:.2f}%"
-    sty = kd[dc].style.format(fm).map(cde, subset=["DD Estado"])
+    
+    sty = kd[dc].style.format(fm, na_rep="—").map(cde, subset=["DD Estado"])
+    
     if has_bal and "DD % Cuenta" in dc: sty = sty.map(cdp, subset=["DD % Cuenta"])
+    if "Stability" in dc: sty = sty.map(color_stability, subset=["Stability"])
+    if "Calmar" in dc: sty = sty.map(color_calmar, subset=["Calmar"])
+    if "Exp (% R)" in dc: sty = sty.map(color_exp_r, subset=["Exp (% R)"])
+    
     st.dataframe(sty, use_container_width=True)
+
     st.markdown("---")
-    st.markdown("#### 🎯 Edge — Comparativa rápida")
-    st.caption("Baseline auto (20 trades). Para ajustar → pestaña **Edge Analytics**.")
-    render_edge_comparison_table(df_pos, tcol, sorted(kpis_df["Robot ID"].astype(str).unique()),
-                                 10, 20, 50, 20, None, account_balance)
+    st.markdown("#### 🎯 Resumen de Salud del Edge")
+    st.caption("Monitoreo rápido (Últimos 20 trades vs Global). El baseline esperado por default es 9% del Riesgo. Para análisis profundo ve a la pestaña **Edge Analytics**.")
+    
+    default_baseline = (risk_per_trade * 0.09) if (risk_per_trade and risk_per_trade > 0) else None
+    render_resumen_salud_table(df_pos, recent_w=20, baseline_manual=default_baseline, baseline_trades=20)
 
 with tab_robot:
     st.subheader("🔎 Curva de equity por trade")
-    robots = sorted(kpis_df['Robot ID'].astype(str).unique())
-    selected = st.selectbox("Robot:", robots, key="tab2_robot_selector")
+    
+    idx2 = robots_list.index(st.session_state.global_robot) if st.session_state.global_robot in robots_list else 0
+    selected = st.selectbox("Robot:", robots_list, index=idx2, key="tab2_robot", on_change=sync_robot_cb, args=("tab2_robot",))
+    
     if selected:
         g = df_pos.copy(); g['robot_id'] = g['robot_id'].astype(str)
         sel = g[g['robot_id']==str(selected)].copy()
@@ -1072,15 +1032,15 @@ with tab_robot:
         sel["equity_trade"] = sel["pnl_real"].cumsum()
         st.line_chart(pd.Series(sel["equity_trade"].values, index=sel["#"]), height=280)
         st.caption(f"Equity acumulada ({', '.join(selected_symbols)})")
-        st.markdown("### 📉 Drawdown en curso")
-        render_current_dd_panel(pd.Series(sel["equity_trade"].values), account_balance, sel[tcol] if tcol in sel.columns else None)
         st.markdown("### 📐 KPIs")
-        sdf = summary_kpis_robot(sel, tcol, account_balance)
+        sdf = summary_kpis_robot(sel, tcol, account_balance, risk_per_trade)
         fms={"net profit (bruto)":"{:.2f}","commissions total":"{:.2f}","swaps total":"{:.2f}","net profit (real)":"{:.2f}",
              "max dd ($)":"{:.2f}","dd actual ($)":"{:.2f}","ret/dd":"{:.2f}","winrate":"{:.2f}%",
-             "profit factor":"{:.2f}","sharpe ratio":"{:.2f}","expectancy":"{:.2f}","stability":"{:.2f}"}
+             "profit factor":"{:.2f}","sharpe ratio":"{:.2f}","expectancy":"{:.2f}","stability":"{:.2f}",
+             "calmar ratio":"{:.2f}"}
+        if "exp (% r)" in sdf.columns: fms["exp (% r)"] = "{:.2%}"
         if account_balance and account_balance > 0: fms["dd actual (% cuenta)"]="{:.2f}%"; fms["max dd (% cuenta)"]="{:.2f}%"
-        st.dataframe(sdf.style.format(fms), use_container_width=True)
+        st.dataframe(sdf.style.format(fms, na_rep="—"), use_container_width=True)
         st.markdown("### 🧾 Historial de trades")
         with st.expander("Filtros", expanded=False):
             mn = pd.to_datetime(sel[tcol].min()) if tcol in sel.columns and not sel.empty else None
@@ -1108,5 +1068,88 @@ with tab_robot:
         st.download_button("⬇️ CSV", hv.to_csv(index=False).encode("utf-8"),
                            f"historial_{str(selected).replace(' ','_')}.csv", "text/csv")
 
+with tab_dd:
+    st.subheader("📉 Drawdown — Panel Centralizado")
+    st.caption("Vista unificada del drawdown en curso para todos los robots, más análisis detallado por robot.")
+
+    st.markdown("#### 🗺️ Estado DD — Todos los Robots")
+    has_bal_dd = account_balance is not None and account_balance > 0
+    robots_dd = robots_list
+    dd_rows = []
+    for rid_dd in robots_dd:
+        g_dd = df_pos[df_pos["robot_id"].astype(str) == rid_dd].copy()
+        oc_dd = []
+        if tcol in g_dd.columns: oc_dd.append(tcol)
+        g_dd = g_dd.sort_values(oc_dd if oc_dd else [tcol], kind="mergesort") if oc_dd else g_dd
+        pnl_dd = g_dd["real_profit"].fillna(0.0)
+        eq_dd = pnl_dd.cumsum()
+        ddi = current_drawdown_info(pd.Series(eq_dd.values), account_balance)
+        sev = dd_severity_label(ddi["dd_pct_account"] if has_bal_dd else None, ddi["is_at_peak"])
+        row_dd = {
+            "Robot": rid_dd,
+            "Trades": len(pnl_dd),
+            "Equity actual ($)": round(float(eq_dd.iloc[-1]) if len(eq_dd) else 0.0, 2),
+            "Peak ($)": round(ddi["peak_value"], 2),
+            "DD Actual ($)": round(ddi["current_dd"], 2),
+            "Max DD ($)": round(ddi["max_dd"], 2),
+            "Trades s/Peak": ddi["trades_since_peak"],
+            "Severidad": sev,
+        }
+        if has_bal_dd:
+            row_dd["DD % Cta"] = round(ddi["dd_pct_account"], 2) if ddi["dd_pct_account"] is not None else 0.0
+            row_dd["Max DD % Cta"] = round(ddi["max_dd_pct_account"], 2) if ddi["max_dd_pct_account"] is not None else 0.0
+        dd_rows.append(row_dd)
+
+    if dd_rows:
+        df_dd_ov = pd.DataFrame(dd_rows)
+        def _sev_color(v):
+            s = str(v).lower()
+            if "peak" in s: return "color:#00d4aa;font-weight:bold"
+            if "leve" in s: return "color:#00d4aa"
+            if "moderado" in s: return "color:#f0c040"
+            if "elevado" in s: return "color:#f0a040;font-weight:bold"
+            if "severo" in s: return "color:#ff4d6d;font-weight:bold"
+            return ""
+        def _pct_color(v):
+            try:
+                x = float(v)
+                if x < 0.01: return "color:#00d4aa;font-weight:bold"
+                if x < 2: return "color:#00d4aa"
+                if x < 5: return "color:#f0c040"
+                if x < 10: return "color:#f0a040;font-weight:bold"
+                return "color:#ff4d6d;font-weight:bold"
+            except: return ""
+        ov_fmt = {"DD Actual ($)": "{:.2f}", "Max DD ($)": "{:.2f}", "Equity actual ($)": "{:.2f}", "Peak ($)": "{:.2f}"}
+        if has_bal_dd:
+            ov_fmt["DD % Cta"] = "{:.2f}%"
+            ov_fmt["Max DD % Cta"] = "{:.2f}%"
+        ov_sty = df_dd_ov.style.format(ov_fmt).map(_sev_color, subset=["Severidad"])
+        if has_bal_dd and "DD % Cta" in df_dd_ov.columns:
+            ov_sty = ov_sty.map(_pct_color, subset=["DD % Cta"])
+        st.dataframe(ov_sty, use_container_width=True, hide_index=True)
+    else:
+        st.info("Sin datos de robots disponibles.")
+
+    st.markdown("---")
+
+    st.markdown("#### 🔍 Análisis Detallado por Robot")
+    
+    idx3 = robots_dd.index(st.session_state.global_robot) if st.session_state.global_robot in robots_dd else 0
+    selected_dd_robot = st.selectbox("Seleccioná un robot:", robots_dd, index=idx3, key="tab3_robot", on_change=sync_robot_cb, args=("tab3_robot",))
+    
+    if selected_dd_robot:
+        g_sel = df_pos[df_pos["robot_id"].astype(str) == selected_dd_robot].copy()
+        oc_sel = []
+        if tcol in g_sel.columns: oc_sel.append(tcol)
+        g_sel = g_sel.sort_values(oc_sel if oc_sel else [tcol], kind="mergesort") if oc_sel else g_sel
+        pnl_sel = g_sel["real_profit"].fillna(0.0)
+        g_sel["#"] = np.arange(1, len(g_sel) + 1)
+        eq_sel = pd.Series(pnl_sel.cumsum().values)
+        render_current_dd_panel(eq_sel, account_balance, g_sel[tcol] if tcol in g_sel.columns else None)
+
+        st.markdown("##### 📈 Curva de Equity")
+        st.line_chart(pd.Series(eq_sel.values, index=range(1, len(eq_sel) + 1)), height=240)
+        st.caption(f"Equity acumulada — {selected_dd_robot}")
+
 with tab_edge:
-    render_edge_tab(df_pos, tcol, account_balance)
+    render_edge_tab(df_pos, tcol, account_balance, risk_per_trade)
