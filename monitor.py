@@ -588,16 +588,16 @@ def render_current_dd_panel(equity: pd.Series, account_balance: float | None = N
 def compute_rolling_expectancy(pnl, window): 
     return pnl.rolling(window=window, min_periods=window).mean()
 
-def obtener_estado_edge(exp_reciente: float, exp_global: float, baseline: float):
+def obtener_estado_edge(exp_reciente: float, exp_global: float, Base: float):
     """Retorna el diagnóstico del semáforo: Nombre Estado, Color Hex, Mensaje Descriptivo"""
-    if exp_reciente >= baseline and exp_reciente >= exp_global:
+    if exp_reciente >= Base and exp_reciente >= exp_global:
         return "🟢 Sano / En Crecimiento", "#00d4aa", "El mercado actual favorece tu lógica operativa. Déjalo correr."
-    elif exp_reciente >= baseline and exp_reciente < exp_global:
+    elif exp_reciente >= Base and exp_reciente < exp_global:
         return "🟡 Normal / Estable", "#f0c040", "El sistema rinde dentro de lo aceptable, pero por debajo de su promedio histórico. Mantener sin cambios."
     else:
-        return "🔴 En Decadencia (Alerta)", "#ff4d6d", "El edge estadístico se ha perdido en el régimen actual (por debajo del Baseline). Evaluar apagar o reducir riesgo."
+        return "🔴 En Decadencia (Alerta)", "#ff4d6d", "El edge estadístico se ha perdido en el régimen actual (por debajo del Base). Evaluar apagar o reducir riesgo."
 
-def render_resumen_salud_table(df_pos, recent_w, baseline_manual, baseline_trades=20):
+def render_resumen_salud_table(df_pos, recent_w, Base_manual, Base_trades=20):
     """Renderiza la tabla de resumen de salud para que sea reutilizable en varias pestañas"""
     robots = sorted(df_pos["robot_id"].astype(str).unique())
     rows_resumen = []
@@ -607,38 +607,49 @@ def render_resumen_salud_table(df_pos, recent_w, baseline_manual, baseline_trade
         pnl_loop = gp["real_profit"].fillna(0.0).reset_index(drop=True)
         if len(pnl_loop) == 0: continue
         
-        b_exp_loop = float(baseline_manual) if baseline_manual is not None else float(pnl_loop.iloc[:min(baseline_trades, len(pnl_loop))].mean())
+        b_exp_loop = float(Base_manual) if Base_manual is not None else float(pnl_loop.iloc[:min(Base_trades, len(pnl_loop))].mean())
         eg_loop = float(pnl_loop.mean())
         er_loop = float(pnl_loop.tail(recent_w).mean()) if len(pnl_loop) >= recent_w else eg_loop
         
+        # Estado Reciente (vs Base y Global)
         est_loop, _, _ = obtener_estado_edge(er_loop, eg_loop, b_exp_loop)
+        
+        # Estado Histórico (Puro Global vs Base)
+        if eg_loop >= b_exp_loop:
+            est_hist = "🟢 Sano (Sobre Base)"
+        elif eg_loop > 0:
+            est_hist = "🟡 Débil (Bajo Base)"
+        else:
+            est_hist = "🔴 Negativo"
         
         rows_resumen.append({
             "Robot": rid_loop,
             "Trades": len(pnl_loop),
             "Exp. Histórica": eg_loop,
             f"Exp. Reciente (N={recent_w})": er_loop,
-            "Baseline": b_exp_loop,
-            "Estado del Edge": est_loop.split(" ", 1)[-1] if " " in est_loop else est_loop  # Elimina el emoji para un sorting más limpio
+            "Base": b_exp_loop,
+            "Estado Reciente": est_loop.split(" ", 1)[-1] if " " in est_loop else est_loop,  # Remueve el emoji para la celda (opcional)
+            "Estado Histórico": est_hist.split(" ", 1)[-1] if " " in est_hist else est_hist
         })
 
     if rows_resumen:
         df_resumen = pd.DataFrame(rows_resumen)
         
         def style_estado(val):
-            if "Sano" in str(val): return "color:#00d4aa; font-weight:bold"
-            if "Normal" in str(val): return "color:#f0c040; font-weight:bold"
-            if "Decadencia" in str(val): return "color:#ff4d6d; font-weight:bold"
+            val_str = str(val)
+            if "Sano" in val_str: return "color:#00d4aa; font-weight:bold"
+            if "Normal" in val_str or "Débil" in val_str: return "color:#f0c040; font-weight:bold"
+            if "Decadencia" in val_str or "Negativo" in val_str: return "color:#ff4d6d; font-weight:bold"
             return ""
 
         format_dict = {
             "Exp. Histórica": "${:.2f}",
             f"Exp. Reciente (N={recent_w})": "${:.2f}",
-            "Baseline": "${:.2f}"
+            "Base": "${:.2f}"
         }
         
         st.dataframe(
-            df_resumen.style.format(format_dict).map(style_estado, subset=["Estado del Edge"]),
+            df_resumen.style.format(format_dict).map(style_estado, subset=["Estado Reciente", "Estado Histórico"]),
             use_container_width=True, hide_index=True
         )
     else:
@@ -652,50 +663,62 @@ def render_edge_tab(df_pos, tcol, account_balance=None, risk_per_trade=None):
     st.subheader("🎯 Dashboard de Control de Mando — Vida del Edge")
     st.caption("Detecta rápidamente si el edge de tu sistema está sano, estable o en decadencia comparando su rendimiento reciente contra el histórico y tu objetivo.")
     
-    robots = sorted(df_pos["robot_id"].astype(str).unique())
-    if not robots: 
+    edge_robots = sorted(df_pos["robot_id"].astype(str).unique())
+    if not edge_robots: 
         st.warning("No hay robots disponibles."); return
 
     # --- Configuración Superior ---
     st.markdown("#### ⚙️ Configuración del Análisis")
     c1, c2, c3 = st.columns([1, 1.5, 1])
     
-    robot_options = {f"🤖 {rid} ({len(df_pos[df_pos['robot_id'].astype(str)==rid])} trades)": rid for rid in robots}
-    selected_rid = robot_options[c1.selectbox("Seleccionar Robot:", list(robot_options.keys()), key="edge_robot_selector")]
+    # Selector Sincronizado
+    def format_robot_option(rid):
+        n_trades = len(df_pos[df_pos['robot_id'].astype(str)==rid])
+        return f"🤖 {rid} ({n_trades} trades)"
+        
+    idx4 = edge_robots.index(st.session_state.global_robot) if st.session_state.global_robot in edge_robots else 0
+    selected_rid = c1.selectbox(
+        "Seleccionar Robot:", 
+        edge_robots, 
+        index=idx4, 
+        format_func=format_robot_option, 
+        key="tab4_robot", 
+        on_change=lambda: st.session_state.update(global_robot=st.session_state.tab4_robot)
+    )
     
     recent_w = c2.number_input("Ventana 'Reciente' (Cantidad de Trades)", min_value=5, max_value=200, value=20, step=5, 
                                help="Cantidad de trades a considerar para evaluar si el sistema funciona 'ahora mismo'.")
                                
-    baseline_mode = c3.radio("Fuente del Baseline:",
+    Base_mode = c3.radio("Fuente del Base:",
         options=["📊 Automático (1ros N)", "✏️ Manual", "🎯 % del Riesgo"],
-        horizontal=False, key="edge_baseline_mode", index=2)
+        horizontal=False, key="edge_Base_mode", index=2)
 
-    # --- Lógica del Baseline ---
-    if baseline_mode.startswith("📊"):
+    # --- Lógica del Base ---
+    if Base_mode.startswith("📊"):
         b_col1, b_col2 = st.columns([1, 3])
-        baseline_trades = b_col1.number_input("Primeros N trades", min_value=10, max_value=200, value=20, step=10)
-        baseline_manual = None
+        Base_trades = b_col1.number_input("Primeros N trades", min_value=10, max_value=200, value=20, step=10)
+        Base_manual = None
         _g = df_pos[df_pos["robot_id"].astype(str)==selected_rid]
         _pnl = _g["real_profit"].fillna(0.0).reset_index(drop=True)
         if len(_pnl) > 0:
-            _bn = min(baseline_trades, len(_pnl))
-            baseline_val_display = float(_pnl.iloc[:_bn].mean())
-    elif baseline_mode.startswith("✏️"):
+            _bn = min(Base_trades, len(_pnl))
+            Base_val_display = float(_pnl.iloc[:_bn].mean())
+    elif Base_mode.startswith("✏️"):
         b_col1, b_col2 = st.columns([1, 3])
-        baseline_manual = b_col1.number_input("Expectancy objetivo ($/trade)", min_value=-1000.0, max_value=10000.0, value=0.0, step=0.01, format="%.2f")
-        baseline_trades = 20
-        baseline_val_display = baseline_manual
+        Base_manual = b_col1.number_input("Expectancy objetivo ($/trade)", min_value=-1000.0, max_value=10000.0, value=0.0, step=0.01, format="%.2f")
+        Base_trades = 20
+        Base_val_display = Base_manual
     else: # 🎯 % del Riesgo
         b_col1, b_col2 = st.columns([1, 3])
         if risk_per_trade is None or risk_per_trade <= 0:
             st.warning("⚠️ Configura el 'Riesgo por Trade' en la barra lateral para usar esta opción.")
-            baseline_manual = 0.0
-            baseline_trades = 20
+            Base_manual = 0.0
+            Base_trades = 20
         else:
             target_pct = b_col1.number_input("Objetivo (% del Riesgo)", min_value=0.0, max_value=500.0, value=9.0, step=1.0)
-            baseline_manual = risk_per_trade * (target_pct / 100.0)
-            baseline_trades = 20
-        baseline_val_display = baseline_manual
+            Base_manual = risk_per_trade * (target_pct / 100.0)
+            Base_trades = 20
+        Base_val_display = Base_manual
         
     st.markdown("---")
 
@@ -709,11 +732,11 @@ def render_edge_tab(df_pos, tcol, account_balance=None, risk_per_trade=None):
         st.info(f"⚠️ El robot tiene {n_trades} trades. Se requieren al menos {recent_w} para un análisis completo de la ventana reciente.")
     
     # Cálculos Clave
-    baseline_exp = float(baseline_manual) if baseline_manual is not None else float(pnl.iloc[:min(baseline_trades, n_trades)].mean())
+    Base_exp = float(Base_manual) if Base_manual is not None else float(pnl.iloc[:min(Base_trades, n_trades)].mean())
     exp_global = float(pnl.mean())
     exp_reciente = float(pnl.tail(recent_w).mean()) if n_trades >= recent_w else exp_global
     
-    estado_str, color_str, msj_str = obtener_estado_edge(exp_reciente, exp_global, baseline_exp)
+    estado_str, color_str, msj_str = obtener_estado_edge(exp_reciente, exp_global, Base_exp)
 
     # --- 1. BANNER DIAGNÓSTICO (SEMÁFORO) ---
     st.markdown(f"### Análisis para: {selected_rid}")
@@ -729,23 +752,23 @@ def render_edge_tab(df_pos, tcol, account_balance=None, risk_per_trade=None):
     m1, m2, m3 = st.columns(3)
     m1.metric("Expectancy Global (Histórica)", f"${exp_global:.2f}", help="Promedio de beneficio de todos los trades del sistema.")
     
-    delta_vs_base = exp_reciente - baseline_exp
-    m2.metric(f"Expectancy Reciente (Últimos {recent_w})", f"${exp_reciente:.2f}", f"{delta_vs_base:+.2f} vs Baseline", 
-              delta_color="normal" if delta_vs_base >= 0 else "inverse", help="Rendimiento del sistema en el mercado actual.")
+    delta_vs_Base = exp_reciente - Base_exp
+    m2.metric(f"Expectancy Reciente (Últimos {recent_w})", f"${exp_reciente:.2f}", f"{delta_vs_Base:+.2f} vs Base", 
+              delta_color="normal" if delta_vs_Base >= 0 else "inverse", help="Rendimiento del sistema en el mercado actual.")
     
-    m3.metric("Baseline (Mínimo Aceptable)", f"${baseline_exp:.2f}", help="El nivel mínimo de expectancy que le exiges a tu sistema.")
+    m3.metric("Base (Mínimo Aceptable)", f"${Base_exp:.2f}", help="El nivel mínimo de expectancy que le exiges a tu sistema.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # --- 3. GRÁFICO ROLLING EXPECTANCY ---
     st.markdown("#### 📈 Evolución del Edge (Rolling Expectancy)")
-    st.caption(f"La línea azul muestra el rendimiento promedio tomando ventanas móviles de **{recent_w} trades**. Mientras esté por encima de la línea punteada (Baseline), tu sistema está sano.")
+    st.caption(f"La línea azul muestra el rendimiento promedio tomando ventanas móviles de **{recent_w} trades**. Mientras esté por encima de la línea punteada (Base), tu sistema está sano.")
     
     roll_exp = compute_rolling_expectancy(pnl, recent_w).dropna()
     if not roll_exp.empty:
         df_chart = pd.DataFrame({
             "Expectancy Reciente": roll_exp.values,
-            "Baseline": [baseline_exp] * len(roll_exp),
+            "Base": [Base_exp] * len(roll_exp),
             "Cero": [0.0] * len(roll_exp)
         }, index=range(1, len(roll_exp) + 1))
         
@@ -758,7 +781,7 @@ def render_edge_tab(df_pos, tcol, account_balance=None, risk_per_trade=None):
 
     # --- 4. RESUMEN DE TODOS LOS SISTEMAS ---
     st.markdown("#### 🏆 Resumen de Salud — Todos los Robots")
-    render_resumen_salud_table(df_pos, recent_w, baseline_manual, baseline_trades)
+    render_resumen_salud_table(df_pos, recent_w, Base_manual, Base_trades)
 
 
 # ==========================================
@@ -854,11 +877,18 @@ if not selected_symbols: st.warning("⚠️ Seleccioná al menos un símbolo.");
 st.sidebar.markdown("---")
 st.sidebar.header("🤖 Filtros de Robots")
 min_trades_filter = st.sidebar.number_input("Mínimo trades/robot", min_value=1, max_value=500, value=1, step=1)
+
 tcol_full = "close_time" if ("close_time" in df_pos_full.columns and df_pos_full["close_time"].notna().any()) else "open_time"
 all_robot_dates = df_pos_full.groupby("robot_id")[tcol_full].max().dropna()
-gmin = all_robot_dates.min().date() if not all_robot_dates.empty else None
+
+# FIX: Obtener la fecha absoluta mínima de todo el historial en lugar de la fecha mínima de finalización
+abs_min_date = df_pos_full[tcol_full].min().date() if not df_pos_full.empty else None
 gmax = all_robot_dates.max().date() if not all_robot_dates.empty else None
-last_activity_after = st.sidebar.date_input("Último trade después de", value=gmin, min_value=gmin, max_value=gmax) if gmin and gmax and gmin<gmax else None
+
+if abs_min_date and gmax:
+    last_activity_after = st.sidebar.date_input("Último trade después de", value=abs_min_date, min_value=abs_min_date, max_value=gmax)
+else:
+    last_activity_after = None
 
 df_pos = df_pos_full[df_pos_full["symbol"].isin(selected_symbols)].copy()
 if df_pos.empty: st.warning("Sin operaciones para esos símbolos."); st.stop()
@@ -878,8 +908,17 @@ if nf > 0: st.sidebar.caption(f"🔍 {nf} robot(s) ocultados.")
 # ==========================================
 kpis_df, key_used, tcol = kpis_por_robot(df_pos, account_balance, risk_per_trade)
 
+# --- Sincronizador Global de Robot ---
+robots_list = sorted(kpis_df['Robot ID'].astype(str).unique())
+if "global_robot" not in st.session_state or st.session_state.global_robot not in robots_list:
+    st.session_state.global_robot = robots_list[0] if len(robots_list) > 0 else None
+
+def sync_robot_cb(key):
+    st.session_state.global_robot = st.session_state[key]
+# ------------------------------------
+
 st.markdown("""<script>
-(function(){function w(){document.querySelectorAll('[data-baseweb="tab"]').forEach(function(t,i){
+(function(){function w(){document.querySelectorAll('[data-Baseweb="tab"]').forEach(function(t,i){
 t.addEventListener('click',function(){var k=['kpis','robot','edge'];var u=new URL(window.location.href);
 u.searchParams.set('tab',k[i]||'kpis');window.history.replaceState({},'',u.toString())})})};
 setTimeout(w,800);new MutationObserver(function(){setTimeout(w,300)}).observe(document.body,{childList:true,subtree:true})})();
@@ -957,16 +996,17 @@ with tab_kpis:
     # ======== Agregado del Resumen de Edge ========
     st.markdown("---")
     st.markdown("#### 🎯 Resumen de Salud del Edge")
-    st.caption("Monitoreo rápido (Últimos 20 trades vs Global). El baseline esperado por default es 9% del Riesgo. Para análisis profundo ve a la pestaña **Edge Analytics**.")
+    st.caption("Monitoreo rápido (Últimos 20 trades vs Global). El Base esperado por default es 9% del Riesgo. Para análisis profundo ve a la pestaña **Edge Analytics**.")
     
-    # Configuramos el baseline por default para la vista global (9% del riesgo si está definido)
-    default_baseline = (risk_per_trade * 0.09) if (risk_per_trade and risk_per_trade > 0) else None
-    render_resumen_salud_table(df_pos, recent_w=20, baseline_manual=default_baseline, baseline_trades=20)
+    default_Base = (risk_per_trade * 0.09) if (risk_per_trade and risk_per_trade > 0) else None
+    render_resumen_salud_table(df_pos, recent_w=20, Base_manual=default_Base, Base_trades=20)
 
 with tab_robot:
     st.subheader("🔎 Curva de equity por trade")
-    robots = sorted(kpis_df['Robot ID'].astype(str).unique())
-    selected = st.selectbox("Robot:", robots, key="tab2_robot_selector")
+    
+    idx2 = robots_list.index(st.session_state.global_robot) if st.session_state.global_robot in robots_list else 0
+    selected = st.selectbox("Robot:", robots_list, index=idx2, key="tab2_robot", on_change=sync_robot_cb, args=("tab2_robot",))
+    
     if selected:
         g = df_pos.copy(); g['robot_id'] = g['robot_id'].astype(str)
         sel = g[g['robot_id']==str(selected)].copy()
@@ -1024,7 +1064,7 @@ with tab_dd:
     # ── Overview table ──────────────────────────────────────────────────────
     st.markdown("#### 🗺️ Estado DD — Todos los Robots")
     has_bal_dd = account_balance is not None and account_balance > 0
-    robots_dd = sorted(kpis_df["Robot ID"].astype(str).unique())
+    robots_dd = robots_list
     dd_rows = []
     for rid_dd in robots_dd:
         g_dd = df_pos[df_pos["robot_id"].astype(str) == rid_dd].copy()
@@ -1084,7 +1124,10 @@ with tab_dd:
 
     # ── Detail per robot ────────────────────────────────────────────────────
     st.markdown("#### 🔍 Análisis Detallado por Robot")
-    selected_dd_robot = st.selectbox("Seleccioná un robot:", robots_dd, key="dd_tab_robot_selector")
+    
+    idx3 = robots_dd.index(st.session_state.global_robot) if st.session_state.global_robot in robots_dd else 0
+    selected_dd_robot = st.selectbox("Seleccioná un robot:", robots_dd, index=idx3, key="tab3_robot", on_change=sync_robot_cb, args=("tab3_robot",))
+    
     if selected_dd_robot:
         g_sel = df_pos[df_pos["robot_id"].astype(str) == selected_dd_robot].copy()
         oc_sel = []
